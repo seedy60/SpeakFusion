@@ -31,6 +31,11 @@ export const routerOptions: RouterOptions = {
 };
 
 export const transportOptions: WebRtcTransportOptions = {
+  // UDP only. We deliberately don't advertise TCP ICE candidates: the firewall
+  // only opens this range for UDP, and TCP fallback is already handled by the
+  // shared coturn (TURN over 3478/tcp, TURNS over 5349/tls). Advertising
+  // unreachable TCP candidates just made ICE slower (clients probed dead
+  // candidates before relaying via coturn anyway).
   listenInfos: [
     {
       protocol: "udp",
@@ -38,24 +43,14 @@ export const transportOptions: WebRtcTransportOptions = {
       announcedAddress: process.env.ANNOUNCED_IP || undefined,
     },
     {
-      protocol: "tcp",
-      ip: "0.0.0.0",
-      announcedAddress: process.env.ANNOUNCED_IP || undefined,
-    },
-    {
       protocol: "udp",
-      ip: "::",
-      announcedAddress: process.env.ANNOUNCED_IP6 || undefined,
-    },
-    {
-      protocol: "tcp",
       ip: "::",
       announcedAddress: process.env.ANNOUNCED_IP6 || undefined,
     },
   ],
   initialAvailableOutgoingBitrate: 600000,
   enableUdp: true,
-  enableTcp: true,
+  enableTcp: false,
   preferUdp: true,
   iceConsentTimeout: 20,
 };

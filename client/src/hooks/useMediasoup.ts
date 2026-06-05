@@ -374,11 +374,17 @@ export function useMediasoup() {
         rtpCapabilities: Record<string, unknown>;
         peers: Array<{ peerId: string; displayName: string; producerIds: string[] }>;
         mode: RoomMode;
+        recording: { recordingId: string } | null;
       }>("join", { roomName, displayName });
 
       store.getState().setRoom(roomName, displayName, socket.id!);
       store.getState().setMode(joinRes.mode);
       modeRef.current = joinRes.mode;
+
+      // The room may already be recording when we join.
+      if (joinRes.recording) {
+        store.getState().setRecording(true, joinRes.recording.recordingId);
+      }
 
       // Add existing peers to store
       for (const peer of joinRes.peers) {
@@ -404,10 +410,12 @@ export function useMediasoup() {
       // --- Socket event handlers ---
       socket.on("peer-joined", ({ peerId, displayName: name }: { peerId: string; displayName: string }) => {
         store.getState().addPeer(peerId, name);
+        store.getState().announce(`${name} joined the room`);
         // In P2P mode, the new peer will send us an offer — we wait for it
       });
 
       socket.on("peer-left", ({ peerId }: { peerId: string }) => {
+        const name = store.getState().peers.get(peerId)?.displayName ?? "A participant";
         // Clean up P2P connection if any
         const pc = p2pConnectionsRef.current.get(peerId);
         if (pc) {
@@ -421,6 +429,25 @@ export function useMediasoup() {
           peerAudiosRef.current.delete(peerId);
         }
         store.getState().removePeer(peerId);
+        store.getState().announce(`${name} left the room`);
+      });
+
+      // --- Recording (room-wide; the server forces SFU while recording) ---
+      socket.on("recording-started", ({ recordingId, by }: { recordingId: string; by: string }) => {
+        store.getState().setRecording(true, recordingId);
+        store.getState().announce(`Recording started by ${by}`);
+      });
+
+      socket.on("recording-stopped", () => {
+        // Keep recordingId so the download link stays available after stopping.
+        store.getState().setRecording(false);
+        store.getState().announce("Recording stopped — still available to download");
+      });
+
+      // The finished recording was cleaned up server-side (TTL) — drop the link.
+      socket.on("recording-expired", () => {
+        store.getState().setRecording(false, null);
+        store.getState().announce("Recording is no longer available");
       });
 
       // P2P signaling relay
@@ -676,6 +703,38 @@ export function useMediasoup() {
     else await startAudioShare();
   }, [store, startAudioShare, stopAudioShare]);
 
+  // --- Recording ---
+  // Recording is server-side: the server taps every participant's stream off
+  // the SFU. Starting it forces the room out of P2P (the server can't see P2P
+  // media). Download happens via /api/recordings/:id/download at any time.
+  const startRecording = useCallback(async () => {
+    if (store.getState().isRecording) return;
+    try {
+      const res = await emit<{ recordingId: string }>("start-recording");
+      store.getState().setRecording(true, res.recordingId);
+    } catch (err) {
+      console.error("[recording] failed to start:", err);
+      store.getState().announce("Could not start recording");
+    }
+  }, [emit, store]);
+
+  const stopRecording = useCallback(async () => {
+    if (!store.getState().isRecording) return;
+    try {
+      await emit("stop-recording");
+    } catch (err) {
+      console.error("[recording] failed to stop:", err);
+    }
+    // The server also broadcasts recording-stopped; mark stopped locally but
+    // keep recordingId so the download link remains until the file expires.
+    store.getState().setRecording(false);
+  }, [emit, store]);
+
+  const toggleRecording = useCallback(async () => {
+    if (store.getState().isRecording) await stopRecording();
+    else await startRecording();
+  }, [startRecording, stopRecording, store]);
+
   const leave = useCallback(() => {
     tearDownAudioShare();
     teardownP2p();
@@ -702,6 +761,9 @@ export function useMediasoup() {
     toggleMute,
     toggleDeafen,
     toggleAudioShare,
+    toggleRecording,
+    startRecording,
+    stopRecording,
     setPeerVolume,
     peerAudiosRef,
   };

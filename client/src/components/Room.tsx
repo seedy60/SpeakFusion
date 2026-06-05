@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Headphones, Users, Loader2 } from "lucide-react";
+import { Headphones, Users, Loader2, Circle } from "lucide-react";
 import { useRoomStore } from "../stores/room";
 import { useMediasoup } from "../hooks/useMediasoup";
 import { ParticipantCard } from "./ParticipantCard";
@@ -11,7 +11,7 @@ type JoinState = "idle" | "joining" | "joined" | "error";
 export function Room() {
   const { roomName } = useParams<{ roomName: string }>();
   const navigate = useNavigate();
-  const { join, leave, toggleMute, toggleAudioShare, setPeerVolume } =
+  const { join, leave, toggleMute, toggleAudioShare, toggleRecording, setPeerVolume } =
     useMediasoup();
 
   const [joinState, setJoinState] = useState<JoinState>("idle");
@@ -23,6 +23,9 @@ export function Room() {
   const peers = useRoomStore((s) => s.peers);
   const isMuted = useRoomStore((s) => s.isMuted);
   const mode = useRoomStore((s) => s.mode);
+  const isRecording = useRoomStore((s) => s.isRecording);
+  const announcement = useRoomStore((s) => s.announcement);
+  const announceSeq = useRoomStore((s) => s.announceSeq);
 
   // Join on mount
   useEffect(() => {
@@ -112,6 +115,15 @@ export function Room() {
           <h1 className="text-lg font-semibold text-sonic-100">{roomName}</h1>
         </div>
         <div className="flex items-center gap-3 text-sm text-sonic-300">
+          {isRecording && (
+            <span
+              className="flex items-center gap-1.5 rounded px-1.5 py-0.5 text-xs font-medium bg-red-500/20 text-red-400"
+              title="This call is being recorded"
+            >
+              <Circle className="h-2.5 w-2.5 animate-pulse fill-red-500 text-red-500" />
+              REC
+            </span>
+          )}
           <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${
             mode === "p2p"
               ? "bg-green-500/20 text-green-400"
@@ -164,12 +176,16 @@ export function Room() {
         <AudioControls
           onToggleMute={toggleMute}
           onToggleAudioShare={toggleAudioShare}
+          onToggleRecording={toggleRecording}
           onLeave={handleLeave}
         />
       </footer>
 
-      {/* Screen reader announcements */}
-      <div aria-live="polite" className="sr-only" id="sr-announcements" />
+      {/* Screen reader announcements (peer join/leave, recording, etc.).
+          key changes per announcement so identical messages re-announce. */}
+      <div aria-live="polite" role="status" className="sr-only" id="sr-announcements">
+        <span key={announceSeq}>{announcement}</span>
+      </div>
     </div>
   );
 }

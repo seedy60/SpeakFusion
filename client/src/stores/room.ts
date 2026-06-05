@@ -25,6 +25,16 @@ interface RoomState {
   pttActive: boolean;
   isSharingAudio: boolean;
 
+  // Recording (a recording belongs to the room; visible to everyone)
+  isRecording: boolean;
+  recordingId: string | null;
+
+  // Latest screen-reader announcement (peer join/leave, recording, etc.).
+  // `announceSeq` changes on every announce() so React re-renders even when
+  // the same message repeats.
+  announcement: string;
+  announceSeq: number;
+
   // Peers
   peers: Map<string, PeerState>;
 
@@ -37,6 +47,8 @@ interface RoomState {
   setPttActive: (active: boolean) => void;
   togglePushToTalk: () => void;
   setSharingAudio: (sharing: boolean) => void;
+  setRecording: (recording: boolean, recordingId?: string | null) => void;
+  announce: (message: string) => void;
   addPeer: (peerId: string, displayName: string) => void;
   removePeer: (peerId: string) => void;
   setPeerSpeaking: (peerId: string, speaking: boolean) => void;
@@ -56,6 +68,10 @@ export const useRoomStore = create<RoomState>((set) => ({
   isPushToTalk: false,
   pttActive: false,
   isSharingAudio: false,
+  isRecording: false,
+  recordingId: null,
+  announcement: "",
+  announceSeq: 0,
   peers: new Map(),
 
   setConnected: (connected) => set({ connected }),
@@ -67,6 +83,12 @@ export const useRoomStore = create<RoomState>((set) => ({
   setPttActive: (pttActive) => set({ pttActive }),
   togglePushToTalk: () => set((s) => ({ isPushToTalk: !s.isPushToTalk })),
   setSharingAudio: (isSharingAudio) => set({ isSharingAudio }),
+  setRecording: (isRecording, recordingId) =>
+    set((s) => ({
+      isRecording,
+      recordingId: recordingId !== undefined ? recordingId : s.recordingId,
+    })),
+  announce: (message) => set((s) => ({ announcement: message, announceSeq: s.announceSeq + 1 })),
 
   addPeer: (peerId, displayName) =>
     set((state) => {
@@ -124,6 +146,10 @@ export const useRoomStore = create<RoomState>((set) => ({
       isPushToTalk: false,
       pttActive: false,
       isSharingAudio: false,
+      isRecording: false,
+      recordingId: null,
+      announcement: "",
+      announceSeq: 0,
       peers: new Map(),
     }),
 }));

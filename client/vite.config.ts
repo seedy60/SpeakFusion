@@ -11,6 +11,10 @@ export default defineConfig({
         target: "http://localhost:3100",
         ws: true,
       },
+      // Recording download endpoint lives on the backend.
+      "/api": {
+        target: "http://localhost:3100",
+      },
     },
   },
 });

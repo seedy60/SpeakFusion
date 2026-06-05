@@ -10,6 +10,8 @@ import {
   type Room,
   type Peer,
 } from "./room-manager.js";
+import { decideMode } from "./recording-util.js";
+import type { RecordingManager } from "./recording.js";
 
 // --- Validation schemas ---
 const roomNameSchema = z
@@ -38,7 +40,7 @@ function closeSfuResources(peer: Peer) {
   peer.consumers.clear();
 }
 
-export function createSignalingServer(httpServer: HttpServer) {
+export function createSignalingServer(httpServer: HttpServer, recordingManager: RecordingManager) {
   const io = new Server(httpServer, {
     cors: { origin: "*" },
     transports: ["websocket"],
@@ -46,36 +48,39 @@ export function createSignalingServer(httpServer: HttpServer) {
     pingTimeout: 10000,
   });
 
+  // When a finished recording is auto-discarded (TTL), tell the room so
+  // clients can hide the now-dead download link.
+  recordingManager.onExpire = (roomName, recordingId) => {
+    io.to(roomName).emit("recording-expired", { recordingId });
+  };
+
+  // --- Evaluate room mode and trigger switches ---
+  // A recording forces SFU and prevents the usual downgrade to P2P, so the
+  // server keeps seeing the media for the whole recording.
+  function applyModeDecision(room: Room) {
+    const decision = decideMode(room.peers.size, room.mode, recordingManager.isRecording(room.name));
+    if (decision.action === "none") return;
+
+    room.mode = decision.mode;
+    if (decision.action === "switch-to-sfu") {
+      console.log(`[room:${room.name}] switching to SFU (${room.peers.size} peers)`);
+      io.to(room.name).emit("switch-to-sfu", {
+        rtpCapabilities: room.router.rtpCapabilities,
+      });
+    } else {
+      console.log(`[room:${room.name}] switching to P2P (${room.peers.size} peers)`);
+      for (const peer of room.peers.values()) {
+        closeSfuResources(peer);
+      }
+      const peerIds = Array.from(room.peers.keys());
+      io.to(room.name).emit("switch-to-p2p", { peerIds });
+    }
+  }
+
   io.on("connection", (socket) => {
     console.log(`[ws] connected: ${socket.id}`);
     let currentRoom: Room | null = null;
     let currentPeer: Peer | null = null;
-
-    // --- Evaluate room mode and trigger switches ---
-    function evaluateMode(room: Room) {
-      const peerCount = room.peers.size;
-      if (peerCount <= 2 && room.mode === "sfu") {
-        // Switch to P2P
-        room.mode = "p2p";
-        console.log(`[room:${room.name}] switching to P2P (${peerCount} peers)`);
-
-        // Tell all peers to tear down SFU and go P2P
-        for (const peer of room.peers.values()) {
-          closeSfuResources(peer);
-        }
-
-        const peerIds = Array.from(room.peers.keys());
-        io.to(room.name).emit("switch-to-p2p", { peerIds });
-      } else if (peerCount > 2 && room.mode === "p2p") {
-        // Switch to SFU
-        room.mode = "sfu";
-        console.log(`[room:${room.name}] switching to SFU (${peerCount} peers)`);
-
-        io.to(room.name).emit("switch-to-sfu", {
-          rtpCapabilities: room.router.rtpCapabilities,
-        });
-      }
-    }
 
     socket.on("join", async (data: unknown, cb: (res: unknown) => void) => {
       try {
@@ -104,20 +109,27 @@ export function createSignalingServer(httpServer: HttpServer) {
             producerIds: Array.from(p.producers.keys()),
           }));
 
-        // Determine mode: 2 peers = p2p, 3+ = sfu
-        const shouldBeSfu = room.peers.size > 2;
-        const wasP2p = room.mode === "p2p";
+        // Determine mode: 3+ peers => SFU, and an active recording also forces
+        // SFU even with <=2 peers.
+        const decision = decideMode(
+          room.peers.size,
+          room.mode,
+          recordingManager.isRecording(room.name),
+        );
 
         cb({
           ok: true,
           rtpCapabilities: room.router.rtpCapabilities,
           peers: existingPeers,
-          mode: shouldBeSfu ? "sfu" : "p2p",
+          mode: decision.mode,
+          recording: recordingManager.isRecording(room.name)
+            ? { recordingId: recordingManager.getRecording(room.name)!.id }
+            : null,
         });
 
-        if (shouldBeSfu && wasP2p) {
-          // 3rd peer just joined — switch everyone to SFU
-          evaluateMode(room);
+        if (decision.action === "switch-to-sfu") {
+          // A new peer pushed the room into SFU — switch everyone else over.
+          applyModeDecision(room);
         }
       } catch (err) {
         cb({ ok: false, error: err instanceof Error ? err.message : "Invalid input" });
@@ -217,6 +229,15 @@ export function createSignalingServer(httpServer: HttpServer) {
 
         currentPeer.producers.set(producer.id, producer);
 
+        // If the room is being recorded, start capturing this producer too.
+        // Not awaited — the produce callback should return promptly, and the
+        // recorder spins up in the background.
+        if (recordingManager.isRecording(currentRoom.name)) {
+          void recordingManager
+            .addProducer(currentRoom.name, { producerId: producer.id, peerId: socket.id })
+            .catch((err) => console.error("[recording] addProducer failed:", err));
+        }
+
         // Notify all other peers that a new producer is available
         socket.to(currentRoom.name).emit("new-producer", {
           peerId: socket.id,
@@ -291,15 +312,87 @@ export function createSignalingServer(httpServer: HttpServer) {
       cb({ ok: true });
     });
 
+    // --- Recording ---
+    socket.on("start-recording", async (_data: unknown, cb: (res: unknown) => void) => {
+      try {
+        if (!currentRoom) {
+          cb({ ok: false, error: "Not in a room" });
+          return;
+        }
+        const room = currentRoom;
+
+        if (recordingManager.isRecording(room.name)) {
+          cb({ ok: true, recordingId: recordingManager.getRecording(room.name)!.id });
+          return;
+        }
+
+        // Snapshot producers that already exist (only present if the room was
+        // already in SFU). In P2P there are none yet — applyModeDecision below
+        // forces SFU, and each peer's `produce` then registers via addProducer.
+        const producers: { producerId: string; peerId: string }[] = [];
+        for (const [peerId, peer] of room.peers) {
+          for (const producerId of peer.producers.keys()) {
+            producers.push({ producerId, peerId });
+          }
+        }
+
+        const rec = await recordingManager.start(room.name, room.router, producers);
+        // Force SFU if we're in P2P so the server can see the media.
+        applyModeDecision(room);
+
+        io.to(room.name).emit("recording-started", {
+          recordingId: rec.id,
+          by: currentPeer?.displayName ?? "Someone",
+        });
+        cb({ ok: true, recordingId: rec.id });
+      } catch (err) {
+        cb({ ok: false, error: err instanceof Error ? err.message : "Failed to start recording" });
+      }
+    });
+
+    socket.on("stop-recording", async (_data: unknown, cb: (res: unknown) => void) => {
+      try {
+        if (!currentRoom) {
+          cb({ ok: false, error: "Not in a room" });
+          return;
+        }
+        const room = currentRoom;
+        // Finalize (not discard): captures stop, but the file stays
+        // downloadable until its TTL / a new recording / room exit.
+        const rec = await recordingManager.finalize(room.name);
+        io.to(room.name).emit("recording-stopped", { recordingId: rec?.id ?? null });
+        // Recording no longer pins SFU — fall back to P2P if <=2 peers remain.
+        applyModeDecision(room);
+        cb({ ok: true });
+      } catch (err) {
+        cb({ ok: false, error: err instanceof Error ? err.message : "Failed to stop recording" });
+      }
+    });
+
     socket.on("disconnect", (reason) => {
       console.log(`[ws] disconnected: ${socket.id} (${reason})`);
       if (currentRoom && currentPeer) {
-        socket.to(currentRoom.name).emit("peer-left", { peerId: socket.id });
-        removePeer(currentRoom, socket.id);
+        const room = currentRoom;
+        socket.to(room.name).emit("peer-left", { peerId: socket.id });
 
-        // Check if we should switch back to P2P
-        if (currentRoom.peers.size > 0) {
-          evaluateMode(currentRoom);
+        // Stop capturing this peer's producers (the already-recorded audio
+        // stays on disk and is still included in downloads).
+        if (recordingManager.isRecording(room.name)) {
+          for (const producerId of currentPeer.producers.keys()) {
+            void recordingManager.removeProducer(room.name, producerId).catch(() => {});
+          }
+        }
+        // If this was the last peer, the room is about to be destroyed — drop
+        // any recording (active or finished-but-downloadable) and its files.
+        if (room.peers.size <= 1 && recordingManager.getRecording(room.name)) {
+          void recordingManager.discard(room.name).catch(() => {});
+        }
+
+        removePeer(room, socket.id);
+
+        // Check if we should switch modes (won't downgrade while recording).
+        if (room.peers.size > 0) {
+          applyModeDecision(room);
         }
       }
     });
