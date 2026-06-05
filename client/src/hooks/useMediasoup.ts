@@ -54,6 +54,12 @@ const sharedAudioContext = new AudioContext({
   latencyHint: "interactive",
 });
 
+// Auto-ducking: how loud the music stays while someone is talking, and the
+// time-constants (seconds) for the smooth gain ramps (duck slower, manual faster).
+const DUCK_FACTOR = 0.22;
+const DUCK_RAMP = 0.18;
+const GAIN_RAMP = 0.03;
+
 // Resume shared context on first user interaction (iOS requirement)
 function resumeSharedContext() {
   if (sharedAudioContext.state === "suspended") {
@@ -101,6 +107,8 @@ export function useMediasoup() {
   const producerRef = useRef<Producer | null>(null);
   const peerAudiosRef = useRef<Map<string, PeerAudio>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
+  // True while the server reports someone is talking (drives music ducking).
+  const isVoiceActiveRef = useRef(false);
   // P2P
   const p2pConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const modeRef = useRef<RoomMode>("p2p");
@@ -124,6 +132,32 @@ export function useMediasoup() {
         });
       }),
     [],
+  );
+
+  // The gain a peer's audio should currently play at, composing the listener's
+  // per-peer volume, deafen, and music auto-ducking (music drops while a voice
+  // is active). Voice peers are unaffected by ducking.
+  const effectiveGain = useCallback(
+    (peerId: string): number => {
+      const peer = store.getState().peers.get(peerId);
+      if (!peer || store.getState().isDeafened) return 0;
+      if (peer.isMusic && isVoiceActiveRef.current) return peer.volume * DUCK_FACTOR;
+      return peer.volume;
+    },
+    [store],
+  );
+
+  // Server told us whether anyone is talking — ramp every music peer's gain.
+  const applyDuck = useCallback(
+    (active: boolean) => {
+      isVoiceActiveRef.current = active;
+      const now = sharedAudioContext.currentTime;
+      for (const [peerId, pa] of peerAudiosRef.current) {
+        if (!store.getState().peers.get(peerId)?.isMusic) continue;
+        pa.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, DUCK_RAMP);
+      }
+    },
+    [store, effectiveGain],
   );
 
   // --- Shared: clean up all peer audio ---
@@ -259,8 +293,12 @@ export function useMediasoup() {
       // Flag a music-caster peer (e.g. Ecobox) so the UI shows it as a media
       // source. Stereo is preserved end-to-end by createAudioPipeline.
       if (source === "music") store.getState().setPeerMusic(peerId, true);
+
+      // Start at the correct gain: respects deafen, and ducks immediately if a
+      // voice is already active when this (music) producer joins.
+      pipeline.gainNode.gain.value = effectiveGain(peerId);
     },
-    [emit, store],
+    [emit, store, effectiveGain],
   );
 
   // --- SFU: set up transports and produce ---
@@ -526,6 +564,11 @@ export function useMediasoup() {
         }
       });
 
+      // Auto-ducking: server says whether anyone is talking right now.
+      socket.on("duck", ({ active }: { active: boolean }) => {
+        applyDuck(active);
+      });
+
       socket.on("peer-muted", ({ peerId }: { peerId: string }) => {
         store.getState().setPeerMuted(peerId, true);
       });
@@ -534,7 +577,7 @@ export function useMediasoup() {
         store.getState().setPeerMuted(peerId, false);
       });
     },
-    [emit, consumeProducer, setupSfu, createP2pConnection, teardownP2p, teardownSfu, store],
+    [emit, consumeProducer, setupSfu, createP2pConnection, teardownP2p, teardownSfu, applyDuck, store],
   );
 
   const mute = useCallback(async () => {
@@ -578,22 +621,28 @@ export function useMediasoup() {
   }, [mute, unmute, store]);
 
   const toggleDeafen = useCallback(() => {
-    const deafened = !store.getState().isDeafened;
-    store.getState().setDeafened(deafened);
-    for (const peerAudio of peerAudiosRef.current.values()) {
-      peerAudio.gainNode.gain.value = deafened ? 0 : 1;
+    store.getState().setDeafened(!store.getState().isDeafened);
+    // Recompute every peer's gain so un-deafen restores per-peer volume (and
+    // any active music duck) instead of resetting everyone to 1.
+    const now = sharedAudioContext.currentTime;
+    for (const [peerId, peerAudio] of peerAudiosRef.current) {
+      peerAudio.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, GAIN_RAMP);
     }
-  }, [store]);
+  }, [store, effectiveGain]);
 
   const setPeerVolume = useCallback(
     (peerId: string, volume: number) => {
+      store.getState().setPeerVolume(peerId, volume);
       const peerAudio = peerAudiosRef.current.get(peerId);
       if (peerAudio) {
-        peerAudio.gainNode.gain.value = volume;
+        peerAudio.gainNode.gain.setTargetAtTime(
+          effectiveGain(peerId),
+          sharedAudioContext.currentTime,
+          GAIN_RAMP,
+        );
       }
-      store.getState().setPeerVolume(peerId, volume);
     },
-    [store],
+    [store, effectiveGain],
   );
 
   // --- Audio share: replace outgoing track in both P2P senders and the SFU producer ---

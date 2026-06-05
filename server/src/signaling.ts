@@ -65,6 +65,26 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
     return recordingManager.isRecording(room.name) || room.casters.size > 0;
   }
 
+  // Auto-ducking: the room's AudioLevelObserver watches VOICE producers only
+  // (music producers are never added — see the produce handler), so it fires
+  // 'volumes' when someone talks and 'silence' when nobody does. We broadcast a
+  // `duck` event on each transition; listeners ramp the music peer's gain down
+  // while a voice is active. Wired once per room.
+  function wireDucking(room: Room) {
+    if (room.observerWired) return;
+    room.observerWired = true;
+    room.audioLevelObserver.on("volumes", () => {
+      if (room.voiceActive) return;
+      room.voiceActive = true;
+      io.to(room.name).emit("duck", { active: true });
+    });
+    room.audioLevelObserver.on("silence", () => {
+      if (!room.voiceActive) return;
+      room.voiceActive = false;
+      io.to(room.name).emit("duck", { active: false });
+    });
+  }
+
   // --- Evaluate room mode and trigger switches ---
   // A recording (or an active music caster) forces SFU and prevents the usual
   // downgrade to P2P, so the server keeps seeing the media.
@@ -98,6 +118,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         const { roomName, displayName, role } = joinSchema.parse(data);
         console.log(`[ws] ${socket.id} joined ${roomName} as "${displayName}"${role ? ` (${role})` : ""}`);
         const room = await getOrCreateRoom(roomName);
+        wireDucking(room);
         const peer = createPeer(room, socket.id, displayName);
 
         // Register a caster BEFORE deciding the mode, so the join response (and
@@ -247,6 +268,15 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         });
 
         currentPeer.producers.set(producer.id, producer);
+
+        // Feed VOICE producers into the audio-level observer so talking ducks
+        // the music. Music producers are deliberately excluded so the music
+        // never ducks itself. (Closed producers auto-remove themselves.)
+        if (producer.kind === "audio" && (source ?? "voice") !== "music") {
+          void currentRoom.audioLevelObserver
+            .addProducer({ producerId: producer.id })
+            .catch((err) => console.error("[duck] addProducer failed:", err));
+        }
 
         // If the room is being recorded, start capturing this producer too.
         // Not awaited — the produce callback should return promptly, and the

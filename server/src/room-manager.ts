@@ -4,6 +4,7 @@ import type {
   Producer,
   Consumer,
   Worker,
+  AudioLevelObserver,
 } from "mediasoup/types";
 import { routerOptions, transportOptions } from "./mediasoup-config.js";
 
@@ -26,6 +27,13 @@ export interface Room {
   // Peer ids of send-only "music caster" peers (e.g. Ecobox). While any are
   // present the room is forced to SFU (see decideMode's forceSfu).
   casters: Set<string>;
+  // Watches VOICE producers only (music producers are never added) to drive
+  // auto-ducking: when someone talks, listeners lower the music peer's volume.
+  audioLevelObserver: AudioLevelObserver;
+  // Latched ducking state so we only broadcast on transitions, and whether the
+  // observer's events have been wired (done once per room in signaling).
+  voiceActive: boolean;
+  observerWired: boolean;
 }
 
 const rooms = new Map<string, Room>();
@@ -50,12 +58,23 @@ export async function getOrCreateRoom(roomName: string): Promise<Room> {
   const worker = getNextWorker();
   const router = await worker.createRouter(routerOptions);
 
+  // -50 dBov ignores room/keyboard noise but catches normal speech; a short
+  // interval keeps ducking responsive. Closed automatically with the router.
+  const audioLevelObserver = await router.createAudioLevelObserver({
+    maxEntries: 1,
+    threshold: -50,
+    interval: 300,
+  });
+
   const room: Room = {
     name: roomName,
     router,
     peers: new Map(),
     mode: "p2p",
     casters: new Set(),
+    audioLevelObserver,
+    voiceActive: false,
+    observerWired: false,
   };
   rooms.set(roomName, room);
   return room;
