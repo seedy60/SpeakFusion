@@ -3,6 +3,7 @@ import { io, type Socket } from "socket.io-client";
 import { Device } from "mediasoup-client";
 import type { Transport, Producer, Consumer } from "mediasoup-client/types";
 import { forceOpusParams } from "../lib/sdp-munger";
+import { playCue } from "../lib/sounds";
 import { useRoomStore, type RoomMode } from "../stores/room";
 
 interface ConsumeResult {
@@ -55,9 +56,12 @@ const sharedAudioContext = new AudioContext({
 });
 
 // Auto-ducking: how loud the music stays while someone is talking, and the
-// time-constants (seconds) for the smooth gain ramps (duck slower, manual faster).
+// setTargetAtTime time-constants (seconds) for the gain ramps. Smaller = snappier.
+// Attack (duck down when a voice starts) is fast; release (bring the music back
+// when the voice stops) is a touch slower to avoid pumping between words.
 const DUCK_FACTOR = 0.22;
-const DUCK_RAMP = 0.18;
+const DUCK_ATTACK = 0.05;
+const DUCK_RELEASE = 0.09;
 const GAIN_RAMP = 0.03;
 
 // Soft limiter sitting after the outgoing mic gain so boosting a quiet/cheap
@@ -165,9 +169,10 @@ export function useMediasoup() {
     (active: boolean) => {
       isVoiceActiveRef.current = active;
       const now = sharedAudioContext.currentTime;
+      const ramp = active ? DUCK_ATTACK : DUCK_RELEASE;
       for (const [peerId, pa] of peerAudiosRef.current) {
         if (!store.getState().peers.get(peerId)?.isMusic) continue;
-        pa.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, DUCK_RAMP);
+        pa.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, ramp);
       }
     },
     [store, effectiveGain],
@@ -521,6 +526,7 @@ export function useMediasoup() {
       socket.on("peer-joined", ({ peerId, displayName: name }: { peerId: string; displayName: string }) => {
         store.getState().addPeer(peerId, name);
         store.getState().announce(`${name} joined the room`);
+        playCue(sharedAudioContext, "join");
         // In P2P mode, the new peer will send us an offer — we wait for it
       });
 
@@ -540,6 +546,7 @@ export function useMediasoup() {
         }
         store.getState().removePeer(peerId);
         store.getState().announce(`${name} left the room`);
+        playCue(sharedAudioContext, "leave");
       });
 
       // --- Recording (room-wide; the server forces SFU while recording) ---
@@ -663,6 +670,8 @@ export function useMediasoup() {
       await emit("producer-pause", {}).catch(() => {});
     }
     store.getState().setMuted(true);
+    store.getState().announce("Microphone muted");
+    playCue(sharedAudioContext, "mute");
   }, [emit, store]);
 
   const unmute = useCallback(async () => {
@@ -677,6 +686,8 @@ export function useMediasoup() {
       await emit("producer-resume", {}).catch(() => {});
     }
     store.getState().setMuted(false);
+    store.getState().announce("Microphone unmuted");
+    playCue(sharedAudioContext, "unmute");
   }, [emit, store]);
 
   const toggleMute = useCallback(async () => {

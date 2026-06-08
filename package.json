@@ -1,9 +1,6 @@
 {
   "name": "sonicroom",
   "private": true,
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "mediasoup"]
-  },
   "scripts": {
     "dev": "pnpm --filter server dev & pnpm --filter client dev",
     "dev:server": "pnpm --filter server dev",

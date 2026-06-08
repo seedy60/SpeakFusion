@@ -23,7 +23,7 @@ const roomNameSchema = z
 const displayNameSchema = z
   .string()
   .min(1)
-  .max(32)
+  .max(256)
   .transform((s) => s.replace(/[<>"'&]/g, ""));
 
 const joinSchema = z.object({
@@ -144,7 +144,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
 
         // Send existing peers to the new joiner. Each producer carries its
         // `source` ("voice" | "music") so a late joiner can label/treat the
-        // music caster ("🎵") without waiting for a new-producer event.
+        // music caster as a media source without waiting for a new-producer event.
         const existingPeers = Array.from(room.peers.entries())
           .filter(([id]) => id !== socket.id)
           .map(([id, p]) => ({

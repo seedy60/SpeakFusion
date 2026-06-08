@@ -51,8 +51,8 @@ export function Lobby() {
         setError("Display name is required");
         return;
       }
-      if (trimmedName.length > 32) {
-        setError("Display name must be 32 characters or less");
+      if (trimmedName.length > 256) {
+        setError("Display name must be 256 characters or less");
         return;
       }
 
@@ -122,7 +122,7 @@ export function Lobby() {
                 setError("");
               }}
               placeholder="Your name"
-              maxLength={32}
+              maxLength={256}
               className="w-full rounded-lg border border-sonic-600 bg-sonic-700 px-4 py-2.5 text-sonic-100 placeholder-sonic-400 transition-colors focus:border-sonic-accent focus:outline-none"
               autoComplete="off"
             />

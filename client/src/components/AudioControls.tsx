@@ -33,7 +33,6 @@ export function AudioControls({
             : "bg-sonic-700 text-sonic-200 hover:bg-sonic-600"
         }`}
         aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
-        aria-pressed={isMuted}
         title="Toggle Mute (M)"
       >
         {isMuted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
