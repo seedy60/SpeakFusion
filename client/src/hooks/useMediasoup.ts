@@ -697,6 +697,8 @@ export function useMediasoup() {
       socket.on("peer-joined", ({ peerId, displayName: name }: { peerId: string; displayName: string }) => {
         store.getState().addPeer(peerId, name);
         store.getState().announce(announce_joined({ name }));
+        const joinTs = Date.now();
+        store.getState().addMessage({ id: `sys-join-${peerId}-${joinTs}`, sender: name, text: "", ts: joinTs, kind: "join" });
         playCue(sharedAudioContext, "join");
         // In P2P mode, the new peer will send us an offer — we wait for it
       });
@@ -722,6 +724,8 @@ export function useMediasoup() {
         }
         store.getState().removePeer(peerId);
         store.getState().announce(announce_left({ name }));
+        const leaveTs = Date.now();
+        store.getState().addMessage({ id: `sys-leave-${peerId}-${leaveTs}`, sender: name, text: "", ts: leaveTs, kind: "leave" });
         playCue(sharedAudioContext, "leave");
       });
 

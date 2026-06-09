@@ -1,3 +1,4 @@
+import { useRef, useState, type KeyboardEvent } from "react";
 import { Mic, MicOff, LogOut, ScreenShare, ScreenShareOff, Circle, Square, Download } from "lucide-react";
 import { useRoomStore } from "../stores/room";
 import { m } from "../paraglide/messages.js";
@@ -20,13 +21,53 @@ export function AudioControls({
   const isRecording = useRoomStore((s) => s.isRecording);
   const recordingId = useRoomStore((s) => s.recordingId);
 
+  // Roving tabindex: the toolbar is a single tab stop and left/right arrows
+  // move focus between its controls (ARIA toolbar pattern).
+  const itemRefs = useRef(new Map<string, HTMLElement>());
+  const [activeId, setActiveId] = useState("mute");
+
+  const orderedIds = ["mute", "share", "record", ...(recordingId ? ["download"] : []), "leave"];
+  // If the active control vanished (e.g. the download link), fall back to the first.
+  const effectiveActiveId = orderedIds.includes(activeId) ? activeId : orderedIds[0];
+
+  const register = (id: string) => (el: HTMLElement | null) => {
+    if (el) itemRefs.current.set(id, el);
+    else itemRefs.current.delete(id);
+  };
+
+  const item = (id: string) => ({
+    ref: register(id),
+    tabIndex: effectiveActiveId === id ? 0 : -1,
+  });
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    const { key } = e;
+    if (key !== "ArrowRight" && key !== "ArrowLeft" && key !== "Home" && key !== "End") return;
+    e.preventDefault();
+    const idx = orderedIds.indexOf(effectiveActiveId);
+    const last = orderedIds.length - 1;
+    const nextIdx =
+      key === "Home"
+        ? 0
+        : key === "End"
+          ? last
+          : key === "ArrowRight"
+            ? (idx + 1) % orderedIds.length
+            : (idx - 1 + orderedIds.length) % orderedIds.length;
+    const nextId = orderedIds[nextIdx];
+    setActiveId(nextId);
+    itemRefs.current.get(nextId)?.focus();
+  };
+
   return (
     <div
       className="flex items-center justify-center gap-3 rounded-2xl border border-sonic-600 bg-sonic-800 p-3"
       role="toolbar"
       aria-label={m.controls_toolbar_label()}
+      onKeyDown={onKeyDown}
     >
       <button
+        {...item("mute")}
         onClick={onToggleMute}
         className={`flex h-11 w-11 items-center justify-center rounded-full transition-all ${
           isMuted
@@ -40,6 +81,7 @@ export function AudioControls({
       </button>
 
       <button
+        {...item("share")}
         onClick={onToggleAudioShare}
         className={`flex h-11 w-11 items-center justify-center rounded-full transition-all ${
           isSharingAudio
@@ -58,6 +100,7 @@ export function AudioControls({
       </button>
 
       <button
+        {...item("record")}
         onClick={onToggleRecording}
         className={`flex h-11 w-11 items-center justify-center rounded-full transition-all ${
           isRecording
@@ -77,6 +120,7 @@ export function AudioControls({
 
       {recordingId && (
         <a
+          {...item("download")}
           href={`/api/recordings/${encodeURIComponent(recordingId)}/download`}
           download={`sonicroom-${recordingId}.ogg`}
           className="flex h-11 items-center gap-2 rounded-full bg-sonic-700 px-4 text-sonic-200 transition-all hover:bg-sonic-600"
@@ -91,6 +135,7 @@ export function AudioControls({
       <div className="h-8 w-px bg-sonic-600" role="separator" />
 
       <button
+        {...item("leave")}
         onClick={onLeave}
         className="flex h-11 items-center gap-2 rounded-full bg-muted/20 px-4 text-muted transition-all hover:bg-muted/30"
         aria-label={m.controls_leave_room()}

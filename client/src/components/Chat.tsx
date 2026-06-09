@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { useRoomStore } from "../stores/room";
-import { relativeTime } from "../lib/chat";
+import { relativeTime, META_SEP } from "../lib/chat";
 import { m } from "../paraglide/messages.js";
 
 interface ChatProps {
@@ -142,14 +142,27 @@ export function Chat({ onSend, onClose }: ChatProps) {
                 else optionRefs.current.delete(msg.id);
               }}
               className={`rounded-md px-2 py-1.5 text-sm leading-snug ${
-                i === activeIdx ? "bg-sonic-accent/20 text-sonic-50" : "text-sonic-200"
-              }`}
+                msg.kind ? "text-center" : ""
+              } ${i === activeIdx ? "bg-sonic-accent/20 text-sonic-50" : "text-sonic-200"}`}
             >
-              <span className="font-medium text-sonic-100">{msg.sender}:</span>{" "}
-              <span>{msg.text}</span>{" "}
-              <span className="text-xs text-sonic-400">
-                {m.chat_sent({ time: relativeTime(msg.ts, now) })}
-              </span>
+              {msg.kind ? (
+                <span className="text-xs italic text-sonic-400">
+                  {msg.kind === "join"
+                    ? m.chat_joined({ name: msg.sender })
+                    : m.chat_left({ name: msg.sender })}
+                  {META_SEP}
+                  {relativeTime(msg.ts, now)}
+                </span>
+              ) : (
+                <>
+                  <span className="font-medium text-sonic-100">{msg.sender}:</span>{" "}
+                  <span>{msg.text}</span>
+                  <span className="text-xs text-sonic-400">
+                    {META_SEP}
+                    {m.chat_sent({ time: relativeTime(msg.ts, now) })}
+                  </span>
+                </>
+              )}
             </li>
           ))}
         </ul>

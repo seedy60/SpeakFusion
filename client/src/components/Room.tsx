@@ -147,15 +147,25 @@ export function Room() {
 
     const handleKeyDown = (e: KeyboardEvent) => {
       // Alt+1..9 and Alt+0 read the last 10 messages aloud via the ARIA region:
-      // 1 = newest, 2 = next, … 0 = the 10th most recent. Works even while
-      // typing in the composer, so it's checked before the input guard below.
-      if (e.altKey && !e.ctrlKey && !e.metaKey && /^[0-9]$/.test(e.key)) {
-        e.preventDefault();
-        const n = e.key === "0" ? 10 : Number(e.key);
-        const { messages: msgs, announce } = useRoomStore.getState();
-        const msg = msgs[msgs.length - n];
-        announce(msg ? formatMessage(msg, Date.now()) : m.room_no_message({ n }));
-        return;
+      // 1 = newest, 2 = next, … 0 = the 10th most recent. The listener is on
+      // window, so it works whether the chat panel is open or closed. Match the
+      // *physical* number key (e.code) rather than e.key so it fires regardless
+      // of layout — on AZERTY/macOS-Option/AltGr, Alt+1 yields a non-digit e.key
+      // (which is why it appeared to only work with the composer focused). Plain
+      // e.key digits stay as a fallback. Checked before the input guard below so
+      // it also works while typing in the composer.
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        const digit =
+          /^(?:Digit|Numpad)([0-9])$/.exec(e.code)?.[1] ??
+          (/^[0-9]$/.test(e.key) ? e.key : null);
+        if (digit != null) {
+          e.preventDefault();
+          const n = digit === "0" ? 10 : Number(digit);
+          const { messages: msgs, announce } = useRoomStore.getState();
+          const msg = msgs[msgs.length - n];
+          announce(msg ? formatMessage(msg, Date.now()) : m.room_no_message({ n }));
+          return;
+        }
       }
 
       if (
@@ -167,6 +177,12 @@ export function Room() {
       if (e.key === "m" || e.key === "M") {
         e.preventDefault();
         toggleMute();
+      } else if (e.key === "a" || e.key === "A") {
+        e.preventDefault();
+        toggleAudioShare();
+      } else if (e.key === "r" || e.key === "R") {
+        e.preventDefault();
+        toggleRecording();
       }
     };
 
@@ -174,7 +190,7 @@ export function Room() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [joinState, toggleMute]);
+  }, [joinState, toggleMute, toggleAudioShare, toggleRecording]);
 
   const handleLeave = useCallback(() => {
     postToHost("readyToClose");
@@ -222,7 +238,6 @@ export function Room() {
           <h1 className="text-lg font-semibold text-sonic-100">{roomName}</h1>
         </div>
         <div className="flex items-center gap-3 text-sm text-sonic-300">
-          <LanguageSelect />
           {isRecording && (
             <span
               className="flex items-center gap-1.5 rounded px-1.5 py-0.5 text-xs font-medium bg-red-500/20 text-red-400"
@@ -273,6 +288,7 @@ export function Room() {
               </span>
             )}
           </button>
+          <LanguageSelect />
         </div>
       </header>
 

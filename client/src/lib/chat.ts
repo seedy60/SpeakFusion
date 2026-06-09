@@ -1,18 +1,27 @@
 // Chat formatting + client-side spam guard. The format string here is the
 // single source of truth for how a message reads in BOTH the visible list and
 // the ARIA announcement, so they never drift apart.
-import { chat_announcement, chat_just_now } from "../paraglide/messages.js";
+import { chat_announcement, chat_just_now, chat_joined, chat_left } from "../paraglide/messages.js";
 import { getLocale } from "./i18n";
 
 export const CHAT_RATE_LIMIT = 5; // messages...
 export const CHAT_RATE_WINDOW_MS = 10_000; // ...per this window (mirrors server)
 export const CHAT_TEXT_MAX = 2000;
 
+// Separates a message from its trailing metadata (the "sent 2 minutes ago"
+// time). A spaced em-dash so the two never run together when the text has no
+// end punctuation — visually and as a pause for screen readers. Used by both
+// the visible list and the ARIA strings, so they stay in lockstep.
+export const META_SEP = " — ";
+
 export interface ChatMessage {
   id: string;
   sender: string;
   text: string;
   ts: number; // epoch ms
+  // Presence events rendered inline in the chat list. Absent = a normal chat
+  // message; "join"/"leave" use `sender` as the participant name and ignore text.
+  kind?: "join" | "leave";
 }
 
 // One RelativeTimeFormat per active locale (constructing them isn't free, and
@@ -41,9 +50,13 @@ export function relativeTime(ts: number, now: number = Date.now()): string {
 }
 
 // e.g. "Alice: see you in 5 sent 2 minutes ago" — used verbatim by the message
-// list and the screen-reader announcement, so both stay in lockstep.
-export function formatMessage(m: ChatMessage, now: number = Date.now()): string {
-  return chat_announcement({ sender: m.sender, text: m.text, time: relativeTime(m.ts, now) });
+// list and the screen-reader announcement, so both stay in lockstep. Presence
+// events read as "Alice joined 2 minutes ago".
+export function formatMessage(msg: ChatMessage, now: number = Date.now()): string {
+  const time = relativeTime(msg.ts, now);
+  if (msg.kind === "join") return `${chat_joined({ name: msg.sender })}${META_SEP}${time}`;
+  if (msg.kind === "leave") return `${chat_left({ name: msg.sender })}${META_SEP}${time}`;
+  return chat_announcement({ sender: msg.sender, text: msg.text, time });
 }
 
 // Single-sender sliding-window limiter for instant local feedback (the server
