@@ -33,7 +33,13 @@ function postToHost(type: string, payload?: Record<string, unknown>) {
 export function Room() {
   const { roomName } = useParams<{ roomName: string }>();
   const [searchParams] = useSearchParams();
-  const disableP2p = isP2pDisabled(searchParams.get("p2p"));
+  // P2P-off can come from the URL (?p2p=off) or — so the choice survives a
+  // reload/rejoin even if the reloaded link drops the query — from a per-room
+  // flag we persist for this tab's session once it's been set.
+  const p2pStorageKey = roomName ? `sonicroom:p2p-off:${roomName}` : null;
+  const disableP2p =
+    isP2pDisabled(searchParams.get("p2p")) ||
+    (p2pStorageKey != null && sessionStorage.getItem(p2pStorageKey) === "1");
   const navigate = useNavigate();
   const {
     join,
@@ -105,13 +111,17 @@ export function Room() {
     joinedRef.current = true;
     setJoinState("joining");
 
+    // Remember the p2p-off choice for this room/tab so a later reload or rejoin
+    // re-asserts it even without the URL param.
+    if (disableP2p && p2pStorageKey) sessionStorage.setItem(p2pStorageKey, "1");
+
     join(roomName, name, { disableP2p })
       .then(() => setJoinState("joined"))
       .catch((err) => {
         setJoinState("error");
         setErrorMsg(err instanceof Error ? err.message : m.room_failed_to_join());
       });
-  }, [roomName, join, navigate, disableP2p, searchParams]);
+  }, [roomName, join, navigate, disableP2p, p2pStorageKey, searchParams]);
 
   // Mirror room lifecycle to the host page when embedded (see postToHost).
   useEffect(() => {

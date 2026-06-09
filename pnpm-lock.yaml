@@ -14,8 +14,8 @@ importers:
         specifier: ^0.510.0
         version: 0.510.0(react@19.2.4)
       mediasoup-client:
-        specifier: ^3.7.18
-        version: 3.18.7
+        specifier: ^3.20.0
+        version: 3.20.0
       react:
         specifier: ^19.1.0
         version: 19.2.4
@@ -66,8 +66,8 @@ importers:
         specifier: ^5.1.0
         version: 5.2.1
       mediasoup:
-        specifier: ^3.15.6
-        version: 3.19.19
+        specifier: ^3.20.4
+        version: 3.20.4
       socket.io:
         specifier: ^4.8.1
         version: 4.8.3
@@ -1285,12 +1285,12 @@ packages:
     resolution: {integrity: sha512-aisnrDP4GNe06UcKFnV5bfMNPBUw4jsLGaWwWfnH3v02GnBuXX2MCVn5RbrWo0j3pczUilYblq7fQ7Nw2t5XKw==}
     engines: {node: '>= 0.8'}
 
-  mediasoup-client@3.18.7:
-    resolution: {integrity: sha512-110f+zYEvSllYoF6didbIznIvSrTwMY9CqDhdWpq1M0goX1HWLoBdguiYB/MqcA858R2dOKDarP1R4vv5RAg1w==}
-    engines: {node: '>=20'}
+  mediasoup-client@3.20.0:
+    resolution: {integrity: sha512-FL6RlsGwvmXbXkbMoc1eW2EqW7k8Cw/Mhls3QewQXH+mioWVeVNWjzcDPmTZ3Sw+mua/n0IH5C/ntuVsx+KegA==}
+    engines: {node: '>=22'}
 
-  mediasoup@3.19.19:
-    resolution: {integrity: sha512-rhaDxUEy+r54LlNBFNDowiWHNzoRTmFLN4PVWjarTrv7BRKq6qkNAkNadiMneo7vgV7YkRCMzfKy76XURP1fYw==}
+  mediasoup@3.20.4:
+    resolution: {integrity: sha512-Q95X0eLNmmUx2wPZsKFFhrbO6W6A872vCfLA779bwsl2LpviEq1ZUdIalBd6ywNYzE+8L+j1/pUHr8xHceWKhg==}
     engines: {node: '>=22'}
 
   merge-descriptors@2.0.0:
@@ -1526,8 +1526,8 @@ packages:
     resolution: {integrity: sha512-1MOpMXuhGzGL5TTCZFItxCc0AARf1EZFQkGqMm7ERKj8+Hgr5oLvJOVFcC+lRmR8hCe2S3jC4T5D7Vg/d7/fhA==}
     engines: {node: '>=6'}
 
-  tar@7.5.13:
-    resolution: {integrity: sha512-tOG/7GyXpFevhXVh8jOPJrmtRpOTsYqUIkVdVooZYJS/z8WhfQUX8RJILmeuJNinGAMSu1veBr4asSHFt5/hng==}
+  tar@7.5.16:
+    resolution: {integrity: sha512-56adEpPMouktRlBLXiaYFFzZ/3+JXa8P9n7WbR+ibIjtviN55mEaOkiysCnPnWm+7kkui1Dn8J9l+g6zV8731w==}
     engines: {node: '>=18'}
 
   tinyglobby@0.2.16:
@@ -2714,7 +2714,7 @@ snapshots:
 
   media-typer@1.1.0: {}
 
-  mediasoup-client@3.18.7:
+  mediasoup-client@3.20.0:
     dependencies:
       '@types/debug': 4.1.13
       '@types/events-alias': '@types/events@3.0.3'
@@ -2726,14 +2726,14 @@ snapshots:
       sdp-transform: 3.0.0
       supports-color: 10.2.2
 
-  mediasoup@3.19.19:
+  mediasoup@3.20.4:
     dependencies:
       debug: 4.4.3(supports-color@10.2.2)
       flatbuffers: 25.9.23
       h264-profile-level-id: 2.3.2(supports-color@10.2.2)
       node-fetch: 3.3.2
       supports-color: 10.2.2
-      tar: 7.5.13
+      tar: 7.5.16
 
   merge-descriptors@2.0.0: {}
 
@@ -3006,7 +3006,7 @@ snapshots:
 
   tapable@2.3.2: {}
 
-  tar@7.5.13:
+  tar@7.5.16:
     dependencies:
       '@isaacs/fs-minipass': 4.0.1
       chownr: 3.0.0

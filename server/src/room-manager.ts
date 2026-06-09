@@ -32,6 +32,10 @@ export interface Room {
   // Peer ids of send-only "music caster" peers (e.g. Ecobox). While any are
   // present the room is forced to SFU (see decideMode's forceSfu).
   casters: Set<string>;
+  // Peer ids currently sharing system/tab audio. Their share is a *separate*
+  // stereo "share" producer (the voice track stays mono), which the server has
+  // to route — so an active sharer forces SFU just like a caster does.
+  sharers: Set<string>;
   // Watches VOICE producers only (music producers are never added) to drive
   // auto-ducking: when someone talks, listeners lower the music peer's volume.
   audioLevelObserver: AudioLevelObserver;
@@ -81,6 +85,7 @@ export async function getOrCreateRoom(roomName: string): Promise<Room> {
     mode: "p2p",
     disableP2p: false,
     casters: new Set(),
+    sharers: new Set(),
     audioLevelObserver,
     voiceActive: false,
     observerWired: false,

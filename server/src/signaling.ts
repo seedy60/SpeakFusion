@@ -52,6 +52,10 @@ const joinSchema = z.object({
   // Explicitly disable P2P for this room (the `?p2p=off` room URL param). Pins
   // the room to the SFU even with <=2 peers; sticky once any joiner sets it.
   disableP2p: z.boolean().optional(),
+  // Set on a reconnect if this peer was sharing audio when it dropped, so the
+  // server re-pins SFU for the rejoin (the share producer is rebuilt right
+  // after, in setupSfu). On a first join it's always false.
+  sharing: z.boolean().optional(),
 });
 
 function closeSfuResources(peer: Peer) {
@@ -122,7 +126,12 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
   // (Ecobox) is present (a caster produces but never sets up P2P). P2P can also
   // be disabled outright for the room via the `?p2p=off` URL param.
   function shouldForceSfu(room: Room): boolean {
-    return recordingManager.isRecording(room.name) || room.casters.size > 0 || room.disableP2p;
+    return (
+      recordingManager.isRecording(room.name) ||
+      room.casters.size > 0 ||
+      room.sharers.size > 0 ||
+      room.disableP2p
+    );
   }
 
   // Auto-ducking: the room's AudioLevelObserver watches VOICE producers only
@@ -175,7 +184,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
 
     socket.on("join", async (data: unknown, cb: (res: unknown) => void) => {
       try {
-        const { roomName, displayName, role, disableP2p } = joinSchema.parse(data);
+        const { roomName, displayName, role, disableP2p, sharing } = joinSchema.parse(data);
         console.log(`[ws] ${socket.id} joined ${roomName} as "${displayName}"${role ? ` (${role})` : ""}${disableP2p ? " (p2p disabled)" : ""}`);
         const room = await getOrCreateRoom(roomName);
         wireDucking(room);
@@ -186,6 +195,9 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         // forced-SFU room. disableP2p is sticky for the room's lifetime.
         if (role === "caster") room.casters.add(socket.id);
         if (disableP2p) room.disableP2p = true;
+        // A peer reconnecting mid-share re-pins SFU before the mode is decided,
+        // so the rejoin lands straight in SFU and its share producer rebuilds.
+        if (sharing) room.sharers.add(socket.id);
 
         currentRoom = room;
         currentPeer = peer;
@@ -343,8 +355,9 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
           .object({
             kind: z.enum(["audio", "video"]) as z.ZodType<MediaKind>,
             rtpParameters: z.any() as z.ZodType<RtpParameters>,
-            // "music" for a caster's stereo track, "voice" (default) for mics.
-            source: z.enum(["voice", "music"]).optional(),
+            // "music" for a caster's stereo track, "share" for a peer's stereo
+            // system/tab-audio share, "voice" (default) for mics.
+            source: z.enum(["voice", "music", "share"]).optional(),
           })
           .parse(data);
 
@@ -357,9 +370,9 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         currentPeer.producers.set(producer.id, producer);
 
         // Feed VOICE producers into the audio-level observer so talking ducks
-        // the music. Music producers are deliberately excluded so the music
-        // never ducks itself. (Closed producers auto-remove themselves.)
-        if (producer.kind === "audio" && (source ?? "voice") !== "music") {
+        // the music. Music/share producers are deliberately excluded so the
+        // music never ducks itself. (Closed producers auto-remove themselves.)
+        if (producer.kind === "audio" && (source ?? "voice") === "voice") {
           void currentRoom.audioLevelObserver
             .addProducer({ producerId: producer.id })
             .catch((err) => console.error("[duck] addProducer failed:", err));
@@ -427,9 +440,12 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
       }
     });
 
+    // Mute/unmute pauses only the VOICE producer — a peer's shared-audio
+    // ("share") producer keeps streaming so the music isn't cut when they mute.
     socket.on("producer-pause", async (_data: unknown, cb: (res: unknown) => void) => {
       if (!currentPeer) return cb({ ok: false });
       for (const producer of currentPeer.producers.values()) {
+        if (((producer.appData?.source as string) ?? "voice") !== "voice") continue;
         await producer.pause();
       }
       if (currentRoom) {
@@ -441,12 +457,48 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
     socket.on("producer-resume", async (_data: unknown, cb: (res: unknown) => void) => {
       if (!currentPeer) return cb({ ok: false });
       for (const producer of currentPeer.producers.values()) {
+        if (((producer.appData?.source as string) ?? "voice") !== "voice") continue;
         await producer.resume();
       }
       if (currentRoom) {
         socket.to(currentRoom.name).emit("peer-unmuted", { peerId: socket.id });
       }
       cb({ ok: true });
+    });
+
+    // --- Audio share (a peer casting system/tab audio as a stereo producer) ---
+    // start-share pins the room to SFU (a stereo producer must be routed by the
+    // server) and announces it; the client then produces a "share" track. We
+    // broadcast share-started/-stopped so peers play a cue + SR announcement.
+    socket.on("start-share", (_data: unknown, cb?: (res: unknown) => void) => {
+      if (!currentRoom || !currentPeer) return cb?.({ ok: false, error: "Not in a room" });
+      currentRoom.sharers.add(socket.id);
+      socket.to(currentRoom.name).emit("share-started", {
+        peerId: socket.id,
+        displayName: currentPeer.displayName,
+      });
+      applyModeDecision(currentRoom);
+      cb?.({ ok: true });
+    });
+
+    socket.on("stop-share", (_data: unknown, cb?: (res: unknown) => void) => {
+      if (!currentRoom || !currentPeer) return cb?.({ ok: false, error: "Not in a room" });
+      currentRoom.sharers.delete(socket.id);
+      // Close this peer's share producer(s) so consumers stop receiving the
+      // music; the matching consumers close client-side via share-stopped.
+      for (const [id, producer] of currentPeer.producers) {
+        if ((producer.appData?.source as string) === "share") {
+          producer.close();
+          currentPeer.producers.delete(id);
+        }
+      }
+      socket.to(currentRoom.name).emit("share-stopped", {
+        peerId: socket.id,
+        displayName: currentPeer.displayName,
+      });
+      // No longer pins SFU — fall back to P2P if <=2 peers and nothing else forces it.
+      applyModeDecision(currentRoom);
+      cb?.({ ok: true });
     });
 
     // --- Recording ---
@@ -526,10 +578,11 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
           void recordingManager.discard(room.name).catch(() => {});
         }
 
-        // Drop this peer from the caster set before removePeer (which may
-        // destroy the room) so the mode decision below no longer forces SFU
-        // once the music caster is gone.
+        // Drop this peer from the caster/sharer sets before removePeer (which
+        // may destroy the room) so the mode decision below no longer forces SFU
+        // once the music caster — or audio-sharer — is gone.
         room.casters.delete(socket.id);
+        room.sharers.delete(socket.id);
 
         removePeer(room, socket.id);
 

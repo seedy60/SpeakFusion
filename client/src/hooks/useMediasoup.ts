@@ -15,6 +15,11 @@ import {
   announce_recording_failed,
   announce_mic_muted,
   announce_mic_unmuted,
+  announce_share_started,
+  announce_share_stopped,
+  announce_share_started_you,
+  announce_share_stopped_you,
+  share_stream_name,
 } from "../paraglide/messages.js";
 import { useRoomStore, type RoomMode } from "../stores/room";
 
@@ -143,10 +148,18 @@ export function useMediasoup() {
     limiter: DynamicsCompressorNode;
     outDest: MediaStreamAudioDestinationNode;
     displaySource: MediaStreamAudioSourceNode | null;
+    // Shared system/tab audio gets its OWN destination so it's produced as a
+    // separate stereo "share" track — the voice track (outDest) stays mono.
+    shareDest: MediaStreamAudioDestinationNode | null;
     micStream: MediaStream | null;
   } | null>(null);
-  // Audio share (system / tab audio mixed into the outgoing graph)
+  // Audio share (system / tab audio produced as its own stereo "share" track)
   const displayStreamRef = useRef<MediaStream | null>(null);
+  // The local stereo "share" producer (SFU), separate from the voice producer.
+  const musicProducerRef = useRef<Producer | null>(null);
+  // Other peers' incoming share streams: producerId -> owner peerId, so we can
+  // tear down a share "music" tile when its owner stops sharing or leaves.
+  const shareOwnersRef = useRef<Map<string, string>>(new Map());
   // Local anti-spam guard for instant "thunk" feedback (the server enforces the
   // same 5-per-10s budget authoritatively).
   const chatLimiterRef = useRef(new RateLimiter());
@@ -199,6 +212,9 @@ export function useMediasoup() {
       destroyAudioPipeline(pa);
     }
     peerAudiosRef.current.clear();
+    // Share streams are keyed in peerAudiosRef too; drop their owner mapping so
+    // a re-consume (mode switch / reconnect) rebuilds it cleanly.
+    shareOwnersRef.current.clear();
   }, []);
 
   // --- Outgoing audio graph (mic gain + soft limiter, + optional shared audio) ---
@@ -227,6 +243,7 @@ export function useMediasoup() {
       limiter,
       outDest,
       displaySource: null,
+      shareDest: null,
       micStream: null,
     };
     return outGraphRef.current;
@@ -271,6 +288,17 @@ export function useMediasoup() {
     async (peerId: string, isOfferer: boolean) => {
       const socket = socketRef.current;
       if (!socket) return;
+
+      // If we already have a connection to this peer (a re-offer, or a mode
+      // switch re-establishing the mesh), tear it down first so the peer map
+      // never ends up pointing at a stale/duplicate RTCPeerConnection — ICE
+      // candidates are routed by peer id, and a dead PC in the map silently
+      // sinks them so ICE never completes.
+      const stale = p2pConnectionsRef.current.get(peerId);
+      if (stale) {
+        stale.close();
+        p2pConnectionsRef.current.delete(peerId);
+      }
 
       const localStream = await ensureLocalStream();
       connectMicToGraph(localStream);
@@ -338,6 +366,8 @@ export function useMediasoup() {
   const teardownSfu = useCallback(() => {
     producerRef.current?.close();
     producerRef.current = null;
+    musicProducerRef.current?.close();
+    musicProducerRef.current = null;
     sendTransportRef.current?.close();
     sendTransportRef.current = null;
     recvTransportRef.current?.close();
@@ -369,6 +399,22 @@ export function useMediasoup() {
       }
 
       const pipeline = createAudioPipeline(consumer.track);
+
+      // A "share" is a peer casting system/tab audio as a SEPARATE stereo
+      // producer (their voice stays its own mono track). Represent it as its
+      // own "music stream" participant keyed by the producer id, so a peer that
+      // produces BOTH voice and a share never collides in the peer/audio maps.
+      // Stereo is preserved end-to-end by createAudioPipeline.
+      if (source === "share") {
+        const ownerName = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
+        store.getState().addPeer(producerId, share_stream_name({ name: ownerName }));
+        store.getState().setPeerMusic(producerId, true);
+        shareOwnersRef.current.set(producerId, peerId);
+        peerAudiosRef.current.set(producerId, { ...pipeline, consumer });
+        pipeline.gainNode.gain.value = effectiveGain(producerId);
+        return;
+      }
+
       peerAudiosRef.current.set(peerId, { ...pipeline, consumer });
 
       // Flag a music-caster peer (e.g. Ecobox) so the UI shows it as a media
@@ -380,6 +426,46 @@ export function useMediasoup() {
       pipeline.gainNode.gain.value = effectiveGain(peerId);
     },
     [emit, store, effectiveGain],
+  );
+
+  // Produce the shared system/tab audio as a SEPARATE stereo, hi-fi "share"
+  // track (the router's 256 kbps ceiling lets it negotiate full quality). The
+  // voice producer is untouched, so voice stays mono/64k. SFU-only — an active
+  // share forces the room onto the SFU server-side. Idempotent.
+  const produceShare = useCallback(async () => {
+    const sendTransport = sendTransportRef.current;
+    const device = deviceRef.current;
+    const g = outGraphRef.current;
+    if (!sendTransport || !device || !g?.shareDest) return;
+    if (musicProducerRef.current && !musicProducerRef.current.closed) return;
+    const track = g.shareDest.stream.getAudioTracks()[0];
+    if (!track) return;
+    musicProducerRef.current = await sendTransport.produce({
+      track,
+      codecOptions: {
+        opusStereo: true,
+        opusDtx: false,
+        opusFec: true,
+        opusMaxPlaybackRate: 48000,
+        opusMaxAverageBitrate: 256000,
+      },
+      codec: device.rtpCapabilities.codecs?.find((c) => c.mimeType.toLowerCase() === "audio/opus"),
+      appData: { source: "share" },
+    });
+  }, []);
+
+  // Tear down an incoming peer's share "music stream" (they stopped, or left).
+  const removeShareStream = useCallback(
+    (producerId: string) => {
+      const pa = peerAudiosRef.current.get(producerId);
+      if (pa) {
+        destroyAudioPipeline(pa);
+        peerAudiosRef.current.delete(producerId);
+      }
+      shareOwnersRef.current.delete(producerId);
+      store.getState().removePeer(producerId);
+    },
+    [store],
   );
 
   // --- SFU: set up transports and produce ---
@@ -422,9 +508,15 @@ export function useMediasoup() {
         }
       });
 
-      sendTransport.on("produce", async ({ kind, rtpParameters }, callback, errback) => {
+      sendTransport.on("produce", async ({ kind, rtpParameters, appData }, callback, errback) => {
         try {
-          const res = await emit<{ producerId: string }>("produce", { kind, rtpParameters });
+          // Forward the track's source ("voice" default, or "share" for a
+          // stereo audio share) so the server tags/routes it correctly.
+          const res = await emit<{ producerId: string }>("produce", {
+            kind,
+            rtpParameters,
+            source: (appData as { source?: string })?.source,
+          });
           callback({ id: res.producerId });
         } catch (e) {
           errback(e as Error);
@@ -466,20 +558,21 @@ export function useMediasoup() {
         codec: device.rtpCapabilities.codecs?.find((c) => c.mimeType.toLowerCase() === "audio/opus"),
       });
       producerRef.current = producer;
+
+      // If we were already sharing audio (a mode switch into SFU, or a
+      // reconnect mid-share), rebuild the separate stereo share producer too.
+      if (store.getState().isSharingAudio) await produceShare();
     },
-    [emit, connectMicToGraph, ensureOutGraph],
+    [emit, connectMicToGraph, ensureOutGraph, produceShare, store],
   );
 
   // --- Main join ---
   const join = useCallback(
     async (roomName: string, displayName: string, opts?: { disableP2p?: boolean }) => {
-      const socket = io({ transports: ["websocket"] });
-      socketRef.current = socket;
-
-      await new Promise<void>((resolve) => socket.on("connect", resolve));
-      store.getState().setConnected(true);
-
-      // Get stereo audio first (needed for both modes)
+      // Acquire stereo audio + build the outgoing graph BEFORE connecting so
+      // it's ready the moment we (re)join. The mic, AudioContext and outgoing
+      // track are reused for the whole session and survive reconnects, so a
+      // network blip never re-prompts for the mic or rebuilds the send chain.
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 2,
@@ -490,58 +583,117 @@ export function useMediasoup() {
         },
       });
       localStreamRef.current = stream;
-      // Build the outgoing graph and route the mic through it, so the gained +
-      // limited track is what every peer / the SFU receives.
       connectMicToGraph(stream);
 
-      // Join room
-      const joinRes = await emit<{
-        ok: boolean;
-        rtpCapabilities: Record<string, unknown>;
-        peers: Array<{
-          peerId: string;
-          displayName: string;
-          producers: Array<{ producerId: string; source: string }>;
-        }>;
-        mode: RoomMode;
-        recording: { recordingId: string } | null;
-        messages: ChatMessage[];
-      }>("join", { roomName, displayName, disableP2p: opts?.disableP2p });
+      const socket = io({ transports: ["websocket"] });
+      socketRef.current = socket;
 
-      store.getState().setRoom(roomName, displayName, socket.id!);
-      store.getState().setMode(joinRes.mode);
-      modeRef.current = joinRes.mode;
+      // (Re)join the room and (re)build all media from the server's response.
+      // Runs on the initial join AND on every reconnect; it never registers
+      // socket handlers (those are attached once, below, and persist across
+      // reconnects).
+      const joinAndSetup = async () => {
+        const joinRes = await emit<{
+          ok: boolean;
+          rtpCapabilities: Record<string, unknown>;
+          peers: Array<{
+            peerId: string;
+            displayName: string;
+            producers: Array<{ producerId: string; source: string }>;
+          }>;
+          mode: RoomMode;
+          recording: { recordingId: string } | null;
+          messages: ChatMessage[];
+        }>("join", {
+          roomName,
+          displayName,
+          disableP2p: opts?.disableP2p,
+          // On a reconnect mid-share, re-pin SFU so the share rebuilds.
+          sharing: store.getState().isSharingAudio,
+        });
 
-      // Seed any chat history (silent — no chime/announce for backlog).
-      for (const m of joinRes.messages ?? []) store.getState().addMessage(m);
+        store.getState().setRoom(roomName, displayName, socket.id!);
+        store.getState().setMode(joinRes.mode);
+        modeRef.current = joinRes.mode;
 
-      // The room may already be recording when we join.
-      if (joinRes.recording) {
-        store.getState().setRecording(true, joinRes.recording.recordingId);
-      }
+        // Seed chat history (de-duped in the store, silent — no chime/announce).
+        for (const m of joinRes.messages ?? []) store.getState().addMessage(m);
 
-      // Add existing peers to store
-      for (const peer of joinRes.peers) {
-        store.getState().addPeer(peer.peerId, peer.displayName);
-      }
+        // Sync recording state — it may have started/stopped while we were away.
+        store.getState().setRecording(
+          !!joinRes.recording,
+          joinRes.recording ? joinRes.recording.recordingId : null,
+        );
 
-      if (joinRes.mode === "p2p") {
-        // P2P: initiate connections to existing peers (we are the offerer)
-        for (const peer of joinRes.peers) {
-          await createP2pConnection(peer.peerId, true);
+        // Reconcile the peer list: drop anyone who left while we were
+        // disconnected, add newcomers. addPeer resets per-peer state, so only
+        // add peers we don't already track (keeps volume/mute across a rejoin).
+        const present = new Set(joinRes.peers.map((p) => p.peerId));
+        for (const id of [...store.getState().peers.keys()]) {
+          if (!present.has(id)) store.getState().removePeer(id);
         }
-      } else {
-        // SFU mode
-        await setupSfu(joinRes.rtpCapabilities);
-        // Consume existing producers
         for (const peer of joinRes.peers) {
-          for (const prod of peer.producers) {
-            await consumeProducer(peer.peerId, prod.producerId, prod.source);
+          if (!store.getState().peers.has(peer.peerId)) {
+            store.getState().addPeer(peer.peerId, peer.displayName);
           }
         }
-      }
 
-      // --- Socket event handlers ---
+        if (joinRes.mode === "p2p") {
+          // P2P: we're the newcomer, so we offer to every existing peer (they
+          // wait for the offer in the p2p-signal handler).
+          for (const peer of joinRes.peers) {
+            await createP2pConnection(peer.peerId, true);
+          }
+        } else {
+          // SFU mode: set up transports, then consume existing producers.
+          await setupSfu(joinRes.rtpCapabilities);
+          for (const peer of joinRes.peers) {
+            for (const prod of peer.producers) {
+              await consumeProducer(peer.peerId, prod.producerId, prod.source);
+            }
+          }
+        }
+      };
+
+      // socket.io fires "connect" on the first connection AND on every
+      // reconnection — each reconnect gets a NEW socket id, so the server has
+      // already dropped our old peer and we must rejoin from scratch. Without
+      // this, a transient drop silently left us in a room the server no longer
+      // knew about: the call appeared to "drop", and a forced-SFU room (e.g.
+      // ?p2p=off) could fall back to P2P for the peers that stayed.
+      let hasJoined = false;
+      let resolveReady!: () => void;
+      let rejectReady!: (err: unknown) => void;
+      const ready = new Promise<void>((res, rej) => {
+        resolveReady = res;
+        rejectReady = rej;
+      });
+
+      socket.on("connect", async () => {
+        store.getState().setConnected(true);
+        try {
+          if (hasJoined) {
+            console.log("[ws] reconnected — rejoining room");
+            // The old transports / peer connections are dead; rebuild them.
+            teardownP2p();
+            teardownSfu();
+          }
+          await joinAndSetup();
+          if (!hasJoined) {
+            hasJoined = true;
+            resolveReady();
+          }
+        } catch (err) {
+          if (hasJoined) console.error("[ws] rejoin failed:", err);
+          else rejectReady(err);
+        }
+      });
+
+      socket.on("disconnect", () => {
+        store.getState().setConnected(false);
+      });
+
+      // --- Socket event handlers (attached once; persist across reconnects) ---
       socket.on("peer-joined", ({ peerId, displayName: name }: { peerId: string; displayName: string }) => {
         store.getState().addPeer(peerId, name);
         store.getState().announce(announce_joined({ name }));
@@ -562,6 +714,11 @@ export function useMediasoup() {
         if (peerAudio) {
           destroyAudioPipeline(peerAudio);
           peerAudiosRef.current.delete(peerId);
+        }
+        // Drop any share "music stream" tiles this peer owned (they may have
+        // left mid-share, without a stop-share/share-stopped first).
+        for (const [producerId, owner] of shareOwnersRef.current) {
+          if (owner === peerId) removeShareStream(producerId);
         }
         store.getState().removePeer(peerId);
         store.getState().announce(announce_left({ name }));
@@ -637,12 +794,18 @@ export function useMediasoup() {
         modeRef.current = "p2p";
         store.getState().setMode("p2p");
 
-        // Connect to the other peer (lower socket ID is offerer for determinism)
+        // Re-establish the mesh. Only the lower-id peer initiates; the higher-id
+        // peer waits for the offer and builds its side in the p2p-signal handler
+        // (same convention as the initial join). Previously BOTH sides called
+        // createP2pConnection here, which raced with the incoming offer also
+        // creating one — the peer map could end up pointing at the orphaned PC,
+        // so ICE candidates went to a dead connection and the call silently
+        // dropped on every SFU→P2P switch (stopping a recording, or a caster
+        // leaving).
         const myId = socket.id!;
         for (const peerId of peerIds) {
-          if (peerId !== myId) {
-            const isOfferer = myId < peerId;
-            await createP2pConnection(peerId, isOfferer);
+          if (peerId !== myId && myId < peerId) {
+            await createP2pConnection(peerId, true);
           }
         }
       });
@@ -657,6 +820,23 @@ export function useMediasoup() {
       // Auto-ducking: server says whether anyone is talking right now.
       socket.on("duck", ({ active }: { active: boolean }) => {
         applyDuck(active);
+      });
+
+      // A peer started sharing system/tab audio — announce it + play a cue.
+      // Their stereo "share" stream arrives separately via new-producer.
+      socket.on("share-started", ({ displayName: name }: { peerId: string; displayName: string }) => {
+        store.getState().announce(announce_share_started({ name }));
+        playCue(sharedAudioContext, "share-start");
+      });
+
+      // A peer stopped sharing — tear down their share "music stream" tile(s),
+      // announce it, and play a cue.
+      socket.on("share-stopped", ({ peerId, displayName: name }: { peerId: string; displayName: string }) => {
+        for (const [producerId, owner] of shareOwnersRef.current) {
+          if (owner === peerId) removeShareStream(producerId);
+        }
+        store.getState().announce(announce_share_stopped({ name }));
+        playCue(sharedAudioContext, "share-stop");
       });
 
       socket.on("peer-muted", ({ peerId }: { peerId: string }) => {
@@ -674,28 +854,25 @@ export function useMediasoup() {
         store.getState().announce(formatMessage(msg, Date.now()));
         playCue(sharedAudioContext, "message");
       });
+
+      // Resolve once the first connect → join → media setup has completed (or
+      // reject if that initial join fails), so callers can flip to "joined".
+      await ready;
     },
-    [emit, consumeProducer, setupSfu, createP2pConnection, teardownP2p, teardownSfu, applyDuck, store],
+    [emit, consumeProducer, setupSfu, createP2pConnection, teardownP2p, teardownSfu, applyDuck, removeShareStream, store],
   );
 
   const mute = useCallback(async () => {
-    // Mute the local mic track directly. When audio sharing is active the
-    // outgoing track is the mixer output, so we only want to silence the
-    // mic — system audio should keep flowing.
+    // Silence the mic track (feeds the voice graph only); any shared system
+    // audio is a separate track/producer, so it keeps flowing. The server
+    // pauses just the VOICE producer, so muting never cuts the music.
     const track = localStreamRef.current?.getAudioTracks()[0];
     if (track) track.enabled = false;
 
-    const sharing = store.getState().isSharingAudio;
-
-    // Only pause the producer/peer-mute signal when the mic is the
-    // outgoing track. Pausing while sharing audio would also stop the
-    // shared system audio.
-    if (!sharing) {
-      if (modeRef.current === "sfu" && producerRef.current) {
-        producerRef.current.pause();
-      }
-      await emit("producer-pause", {}).catch(() => {});
+    if (modeRef.current === "sfu" && producerRef.current) {
+      producerRef.current.pause();
     }
+    await emit("producer-pause", {}).catch(() => {});
     store.getState().setMuted(true);
     store.getState().announce(announce_mic_muted());
     playCue(sharedAudioContext, "mute");
@@ -705,13 +882,10 @@ export function useMediasoup() {
     const track = localStreamRef.current?.getAudioTracks()[0];
     if (track) track.enabled = true;
 
-    const sharing = store.getState().isSharingAudio;
-    if (!sharing) {
-      if (modeRef.current === "sfu" && producerRef.current) {
-        producerRef.current.resume();
-      }
-      await emit("producer-resume", {}).catch(() => {});
+    if (modeRef.current === "sfu" && producerRef.current) {
+      producerRef.current.resume();
     }
+    await emit("producer-resume", {}).catch(() => {});
     store.getState().setMuted(false);
     store.getState().announce(announce_mic_unmuted());
     playCue(sharedAudioContext, "unmute");
@@ -747,22 +921,37 @@ export function useMediasoup() {
     [store, effectiveGain],
   );
 
-  // --- Audio share: mix system/tab audio into the persistent outgoing graph ---
-  // The outgoing track never changes — we just connect/disconnect the display
-  // branch — so there's no track-swapping on senders/producer.
+  // --- Audio share: cast system/tab audio as a SEPARATE stereo producer ---
+  // The shared audio gets its own destination (shareDest) and its own stereo
+  // "share" producer, so the voice track stays mono/64k and is never touched.
   const detachSharedAudio = useCallback(() => {
     const g = outGraphRef.current;
     g?.displaySource?.disconnect();
-    if (g) g.displaySource = null;
+    g?.shareDest?.disconnect();
+    if (g) {
+      g.displaySource = null;
+      g.shareDest = null;
+    }
     displayStreamRef.current?.getTracks().forEach((t) => t.stop());
     displayStreamRef.current = null;
   }, []);
 
   const stopAudioShare = useCallback(async () => {
     if (!store.getState().isSharingAudio) return;
+    // Close our stereo share producer, then detach the shared-audio nodes.
+    if (musicProducerRef.current) {
+      if (!musicProducerRef.current.closed) musicProducerRef.current.close();
+      musicProducerRef.current = null;
+    }
     detachSharedAudio();
     store.getState().setSharingAudio(false);
-  }, [store, detachSharedAudio]);
+    // Tell the server: drop us from the sharer set (may release the SFU pin)
+    // and close the server-side producer so peers' tiles disappear.
+    await emit("stop-share").catch(() => {});
+    // Local feedback; peers get theirs via the share-stopped broadcast.
+    store.getState().announce(announce_share_stopped_you());
+    playCue(sharedAudioContext, "share-stop");
+  }, [store, detachSharedAudio, emit]);
 
   const startAudioShare = useCallback(async () => {
     if (store.getState().isSharingAudio) return;
@@ -797,12 +986,14 @@ export function useMediasoup() {
     // Discard the video track — we don't need to send any video
     displayStream.getVideoTracks().forEach((t) => t.stop());
 
-    // Mix the shared audio straight into the outgoing destination, bypassing
-    // the mic gain/limiter so the music keeps its full dynamics.
+    // Route the shared audio into its OWN destination (not the voice graph), so
+    // it becomes a separate stereo producer and the voice track stays mono.
     const g = ensureOutGraph();
+    const shareDest = sharedAudioContext.createMediaStreamDestination();
     const displaySource = sharedAudioContext.createMediaStreamSource(new MediaStream(audioTracks));
-    displaySource.connect(g.outDest);
+    displaySource.connect(shareDest);
     g.displaySource = displaySource;
+    g.shareDest = shareDest;
     displayStreamRef.current = displayStream;
 
     // Fire when the user hits the browser's "Stop sharing" UI
@@ -811,7 +1002,19 @@ export function useMediasoup() {
     });
 
     store.getState().setSharingAudio(true);
-  }, [store, ensureOutGraph, stopAudioShare]);
+
+    // A stereo producer must be routed by the server, so pin the room to SFU.
+    // If we're already on the SFU, produce now; otherwise the resulting
+    // switch-to-sfu rebuilds the SFU and setupSfu produces the share (it sees
+    // isSharingAudio). Either way produceShare is idempotent.
+    const wasSfu = modeRef.current === "sfu";
+    await emit("start-share").catch(() => {});
+    if (wasSfu) await produceShare();
+
+    // Local feedback; peers get theirs via the share-started broadcast.
+    store.getState().announce(announce_share_started_you());
+    playCue(sharedAudioContext, "share-start");
+  }, [store, ensureOutGraph, stopAudioShare, produceShare, emit]);
 
   const toggleAudioShare = useCallback(async () => {
     if (store.getState().isSharingAudio) await stopAudioShare();
@@ -896,8 +1099,11 @@ export function useMediasoup() {
       g.micGain.disconnect();
       g.limiter.disconnect();
       g.displaySource?.disconnect();
+      g.shareDest?.disconnect();
       outGraphRef.current = null;
     }
+    musicProducerRef.current = null;
+    shareOwnersRef.current.clear();
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     localStreamRef.current = null;
     socketRef.current?.disconnect();

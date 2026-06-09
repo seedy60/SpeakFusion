@@ -83,6 +83,7 @@
   "card_muted_fragment": "silenciado",
   "card_speaking_fragment": "hablando",
   "card_music_stream": "Transmisión de música",
+  "share_stream_name": "{name} (audio compartido)",
   "card_muted_status": "Silenciado",
   "card_unmuted_status": "Activado",
   "card_volume_for": "Volumen de {name}",
@@ -97,5 +98,9 @@
   "announce_recording_unavailable": "La grabación ya no está disponible",
   "announce_mic_muted": "Micrófono silenciado",
   "announce_mic_unmuted": "Micrófono activado",
-  "announce_recording_failed": "No se pudo iniciar la grabación"
+  "announce_recording_failed": "No se pudo iniciar la grabación",
+  "announce_share_started": "{name} empezó a compartir audio",
+  "announce_share_stopped": "{name} dejó de compartir audio",
+  "announce_share_started_you": "Empezaste a compartir audio",
+  "announce_share_stopped_you": "Dejaste de compartir audio"
 }

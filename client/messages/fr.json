@@ -83,6 +83,7 @@
   "card_muted_fragment": "micro coupé",
   "card_speaking_fragment": "parle",
   "card_music_stream": "Flux musical",
+  "share_stream_name": "{name} (audio partagé)",
   "card_muted_status": "Micro coupé",
   "card_unmuted_status": "Micro activé",
   "card_volume_for": "Volume de {name}",
@@ -97,5 +98,9 @@
   "announce_recording_unavailable": "L'enregistrement n'est plus disponible",
   "announce_mic_muted": "Micro coupé",
   "announce_mic_unmuted": "Micro activé",
-  "announce_recording_failed": "Impossible de démarrer l'enregistrement"
+  "announce_recording_failed": "Impossible de démarrer l'enregistrement",
+  "announce_share_started": "{name} a commencé à partager de l'audio",
+  "announce_share_stopped": "{name} a arrêté de partager de l'audio",
+  "announce_share_started_you": "Vous avez commencé à partager de l'audio",
+  "announce_share_stopped_you": "Vous avez arrêté de partager de l'audio"
 }

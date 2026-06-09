@@ -3,7 +3,15 @@
 // routed into the outgoing mic graph, so peers don't hear them. Tones use a
 // quick exponential gain envelope so they never click.
 
-export type Cue = "mute" | "unmute" | "join" | "leave" | "message" | "thunk";
+export type Cue =
+  | "mute"
+  | "unmute"
+  | "join"
+  | "leave"
+  | "message"
+  | "thunk"
+  | "share-start"
+  | "share-stop";
 
 interface ToneSpec {
   freq: number;
@@ -70,6 +78,18 @@ export function playCue(ctx: AudioContext, cue: Cue) {
     // with anything positive.
     case "thunk":
       tone(ctx, { freq: 170, glideTo: 120, dur: 0.13, type: "square", gain: 0.09 });
+      break;
+    // Audio share toggled: a soft triangle arpeggio — rising (C-E-G) when a
+    // share starts, falling when it stops. Distinct from the sine presence cues.
+    case "share-start":
+      tone(ctx, { freq: 523, dur: 0.09, type: "triangle", gain: 0.1 });
+      tone(ctx, { freq: 659, dur: 0.09, type: "triangle", gain: 0.1, delay: 0.08 });
+      tone(ctx, { freq: 784, dur: 0.13, type: "triangle", gain: 0.1, delay: 0.16 });
+      break;
+    case "share-stop":
+      tone(ctx, { freq: 784, dur: 0.09, type: "triangle", gain: 0.1 });
+      tone(ctx, { freq: 659, dur: 0.09, type: "triangle", gain: 0.1, delay: 0.08 });
+      tone(ctx, { freq: 523, dur: 0.13, type: "triangle", gain: 0.1, delay: 0.16 });
       break;
   }
 }
