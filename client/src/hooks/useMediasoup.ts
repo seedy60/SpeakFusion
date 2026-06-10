@@ -1159,6 +1159,10 @@ export function useMediasoup() {
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
+          // Exclude this page's own playback (the other participants) from
+          // system-audio capture, so they don't get looped back and doubled.
+          // Chrome 140+ on Windows/macOS; ignored elsewhere.
+          restrictOwnAudio: true,
         } as MediaTrackConstraints,
       });
     } catch {
