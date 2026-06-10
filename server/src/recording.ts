@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir as fsMkdir, writeFile as fsWriteFile, rm as fsRm } from "node:fs/promises";
 import { statSync } from "node:fs";
 import path from "node:path";
@@ -167,7 +168,6 @@ export function createDefaultDeps(overrides: Partial<RecordingDeps> = {}): Recor
 export class RecordingManager {
   private readonly deps: RecordingDeps;
   private readonly recordings = new Map<string, RoomRecording>();
-  private idCounter = 0;
 
   // Set by the signaling layer so the manager can tell the room when a
   // finished recording is auto-discarded (so clients hide the stale link).
@@ -198,12 +198,18 @@ export class RecordingManager {
   ): Promise<RoomRecording> {
     const existing = this.recordings.get(roomName);
     if (existing?.status === "recording") return existing;
-    if (existing) await this.discard(roomName);
+    if (existing) {
+      await this.discard(roomName);
+      // A concurrent start() may have claimed the room while discard awaited.
+      const claimed = this.recordings.get(roomName);
+      if (claimed?.status === "recording") return claimed;
+    }
 
     const startedAt = this.deps.now();
-    const id = `rec_${startedAt.toString(36)}_${(this.idCounter++).toString(36)}`;
+    // Random id: the download URLs are unauthenticated and rely on this being
+    // an unguessable capability token (a timestamp-based id is enumerable).
+    const id = `rec_${randomUUID()}`;
     const dir = path.join(this.deps.tmpRoot, id);
-    await this.deps.mkdir(dir);
 
     const rec: RoomRecording = {
       id,
@@ -216,7 +222,17 @@ export class RecordingManager {
       ttlHandle: null,
       closing: false,
     };
+    // Claim the room slot BEFORE the first await below — two concurrent
+    // start() calls could otherwise both pass the checks above, and the
+    // losing recording would be orphaned with its ffmpeg processes and
+    // ports never released.
     this.recordings.set(roomName, rec);
+    try {
+      await this.deps.mkdir(dir);
+    } catch (err) {
+      this.recordings.delete(roomName);
+      throw err;
+    }
     this.deps.log(`started ${id} for room "${roomName}" (${producers.length} producer(s))`);
 
     for (const info of producers) {

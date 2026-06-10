@@ -157,14 +157,22 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
   // --- Evaluate room mode and trigger switches ---
   // A recording (or an active music caster) forces SFU and prevents the usual
   // downgrade to P2P, so the server keeps seeing the media.
-  function applyModeDecision(room: Room) {
+  // exceptSocketId: when a newly-joined peer pushes the room into SFU, that peer
+  // already learned mode:"sfu" from its join response and sets up the SFU from
+  // it — so it must be EXCLUDED from the switch broadcast, or it would set up
+  // SFU twice concurrently (duplicate transports → "connect() already called",
+  // and one transport that never finishes connecting).
+  function applyModeDecision(room: Room, exceptSocketId?: string) {
     const decision = decideMode(room.peers.size, room.mode, shouldForceSfu(room));
     if (decision.action === "none") return;
 
     room.mode = decision.mode;
+    const targets = exceptSocketId
+      ? io.to(room.name).except(exceptSocketId)
+      : io.to(room.name);
     if (decision.action === "switch-to-sfu") {
       console.log(`[room:${room.name}] switching to SFU (${room.peers.size} peers)`);
-      io.to(room.name).emit("switch-to-sfu", {
+      targets.emit("switch-to-sfu", {
         rtpCapabilities: room.router.rtpCapabilities,
       });
     } else {
@@ -173,7 +181,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         closeSfuResources(peer);
       }
       const peerIds = Array.from(room.peers.keys());
-      io.to(room.name).emit("switch-to-p2p", { peerIds });
+      targets.emit("switch-to-p2p", { peerIds });
     }
   }
 
@@ -218,6 +226,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
           .map(([id, p]) => ({
             peerId: id,
             displayName: p.displayName,
+            muted: p.muted,
             producers: Array.from(p.producers.values()).map((prod) => ({
               producerId: prod.id,
               source: (prod.appData?.source as string) ?? "voice",
@@ -236,13 +245,18 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
           recording: recordingManager.isRecording(room.name)
             ? { recordingId: recordingManager.getRecording(room.name)!.id }
             : null,
+          // Whether someone is talking RIGHT NOW, so a late joiner starts
+          // music peers ducked instead of waiting for the next transition.
+          voiceActive: room.voiceActive,
           // Recent chat so a late joiner can read/announce the last messages.
           messages: room.messages,
         });
 
         if (decision.action === "switch-to-sfu") {
-          // A new peer pushed the room into SFU — switch everyone else over.
-          applyModeDecision(room);
+          // A new peer pushed the room into SFU — switch everyone ELSE over.
+          // Exclude this socket: it already got mode:"sfu" in its join response
+          // and sets up the SFU from that, so re-notifying it would double-setup.
+          applyModeDecision(room, socket.id);
         }
       } catch (err) {
         cb({ ok: false, error: err instanceof Error ? err.message : "Invalid input" });
@@ -449,6 +463,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
     // ("share") producer keeps streaming so the music isn't cut when they mute.
     socket.on("producer-pause", async (_data: unknown, cb: (res: unknown) => void) => {
       if (!currentPeer) return cb({ ok: false });
+      currentPeer.muted = true;
       for (const producer of currentPeer.producers.values()) {
         if (((producer.appData?.source as string) ?? "voice") !== "voice") continue;
         await producer.pause();
@@ -461,6 +476,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
 
     socket.on("producer-resume", async (_data: unknown, cb: (res: unknown) => void) => {
       if (!currentPeer) return cb({ ok: false });
+      currentPeer.muted = false;
       for (const producer of currentPeer.producers.values()) {
         if (((producer.appData?.source as string) ?? "voice") !== "voice") continue;
         await producer.resume();
@@ -495,6 +511,11 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         if ((producer.appData?.source as string) === "share") {
           producer.close();
           currentPeer.producers.delete(id);
+          // Also stop its capture if recording — otherwise the recorder's
+          // ffmpeg idles on a dead port until the recording ends.
+          if (recordingManager.isRecording(currentRoom.name)) {
+            void recordingManager.removeProducer(currentRoom.name, id).catch(() => {});
+          }
         }
       }
       socket.to(currentRoom.name).emit("share-stopped", {

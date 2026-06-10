@@ -163,8 +163,8 @@ describe("buildMixArgs", () => {
       { path: "/tmp/b.ogg", delayMs: 1500 },
     ]);
     const fc = args[args.indexOf("-filter_complex") + 1];
-    assert.ok(fc.includes("[0:a]anull[a0]"));
-    assert.ok(fc.includes("[1:a]adelay=1500:all=1[a1]"));
+    assert.ok(fc.includes("[0:a]aformat=channel_layouts=stereo,aresample=async=1[a0]"));
+    assert.ok(fc.includes("[1:a]aformat=channel_layouts=stereo,aresample=async=1,adelay=1500:all=1[a1]"));
     assert.ok(fc.includes("amix=inputs=2:normalize=0[out]"));
     assert.deepEqual(args.slice(-2), ["ogg", "pipe:1"]);
     assert.ok(args.includes("libopus"));

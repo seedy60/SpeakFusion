@@ -160,8 +160,15 @@ export function buildMixArgs(inputs: MixInput[]): string[] {
       const label = `a${i}`;
       labels.push(`[${label}]`);
       const d = Math.max(0, Math.round(input.delayMs));
-      // adelay shifts a late-joining stream so voices line up in time.
-      parts.push(d > 0 ? `[${i}:a]adelay=${d}:all=1[${label}]` : `[${i}:a]anull[${label}]`);
+      // Per-input chain, in order:
+      //  - aformat upmixes mono voice to stereo BEFORE amix (amix adopts the
+      //    first input's layout, so a mono-first mix would fold the stereo
+      //    music/share tracks down to mono);
+      //  - aresample async fills timestamp gaps with silence so a track that
+      //    paused mid-recording (mute, share stopped) stays time-aligned;
+      //  - adelay shifts a late-joining stream so voices line up in time.
+      const chain = `aformat=channel_layouts=stereo,aresample=async=1${d > 0 ? `,adelay=${d}:all=1` : ""}`;
+      parts.push(`[${i}:a]${chain}[${label}]`);
     });
     // normalize=0 keeps each voice at full level instead of dividing by N
     // (which would make everyone quieter as more people join).

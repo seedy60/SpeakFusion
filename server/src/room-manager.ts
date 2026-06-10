@@ -12,6 +12,9 @@ import type { ChatMessage } from "./chat-util.js";
 export interface Peer {
   id: string;
   displayName: string;
+  // Mirrors the client's mute toggle (set via producer-pause/-resume, which
+  // fire in P2P mode too) so late joiners can render existing peers' state.
+  muted: boolean;
   sendTransport: WebRtcTransport | null;
   recvTransport: WebRtcTransport | null;
   producers: Map<string, Producer>;
@@ -99,6 +102,7 @@ export function createPeer(room: Room, peerId: string, displayName: string): Pee
   const peer: Peer = {
     id: peerId,
     displayName,
+    muted: false,
     sendTransport: null,
     recvTransport: null,
     producers: new Map(),
