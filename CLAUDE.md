@@ -79,6 +79,6 @@ UI strings live in `client/messages/{en,es,fr}.json` (flat key→string, `{var}`
 
 ## Deployment / runtime
 
-- Runs under systemd as **`sonicroom.service`** (`ExecStart=/usr/bin/pnpm start`, `WorkingDirectory=/home/fasttalk`). Env: `PORT` (3100), `ANNOUNCED_IP` / `ANNOUNCED_IP6` (the VPS public IPs — required for ICE), `NODE_ENV=production`. Restart with `systemctl restart sonicroom`.
+- Runs under systemd as **`sonicroom.service`** (`ExecStart=/usr/bin/pnpm start`, `WorkingDirectory=/home/sonicroom`). Env: `PORT` (3100), `ANNOUNCED_IP` / `ANNOUNCED_IP6` (the VPS public IPs — required for ICE), `NODE_ENV=production`. Restart with `systemctl restart sonicroom`.
 - **Client changes need only `pnpm build`** — `express.static(client/dist)` serves the new bundle on the next page load, so no server restart and no dropped calls. **Restart the service only for server-code changes** (server runs TS live via tsx).
 - Ports: WebRTC media UDP **40000–40100**; recording RTP **50000–50998**. ICE is **UDP-only** by design; TCP/TLS fallback is handled by an external coturn (`turn.oriolgomez.com`). TURN credentials are in client code intentionally (WebRTC requires them browser-side).

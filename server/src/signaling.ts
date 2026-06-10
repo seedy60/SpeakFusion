@@ -19,7 +19,7 @@ import {
   CHAT_TEXT_MAX,
   type ChatMessage,
 } from "./chat-util.js";
-import type { RecordingManager } from "./recording.js";
+import type { RecordingManager, ProducerInfo } from "./recording.js";
 
 // --- Validation schemas ---
 const roomNameSchema = z
@@ -383,7 +383,12 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         // recorder spins up in the background.
         if (recordingManager.isRecording(currentRoom.name)) {
           void recordingManager
-            .addProducer(currentRoom.name, { producerId: producer.id, peerId: socket.id })
+            .addProducer(currentRoom.name, {
+              producerId: producer.id,
+              peerId: socket.id,
+              label: currentPeer.displayName,
+              source: source ?? "voice",
+            })
             .catch((err) => console.error("[recording] addProducer failed:", err));
         }
 
@@ -518,10 +523,15 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         // Snapshot producers that already exist (only present if the room was
         // already in SFU). In P2P there are none yet — applyModeDecision below
         // forces SFU, and each peer's `produce` then registers via addProducer.
-        const producers: { producerId: string; peerId: string }[] = [];
+        const producers: ProducerInfo[] = [];
         for (const [peerId, peer] of room.peers) {
-          for (const producerId of peer.producers.keys()) {
-            producers.push({ producerId, peerId });
+          for (const [producerId, producer] of peer.producers) {
+            producers.push({
+              producerId,
+              peerId,
+              label: peer.displayName,
+              source: (producer.appData?.source as string) ?? "voice",
+            });
           }
         }
 

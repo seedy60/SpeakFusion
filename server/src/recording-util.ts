@@ -202,3 +202,25 @@ export function decideMode(
 export function computeDelayMs(recordingStartedAt: number, recorderStartedAt: number): number {
   return Math.max(0, recorderStartedAt - recordingStartedAt);
 }
+
+// Friendly, unique file name for one captured track inside the per-track zip.
+// Shape: `NN-<who>[-<source>].ogg`, e.g. `01-alice.ogg`, `02-alice-share.ogg`,
+// `03-ecobox-music.ogg`. The `NN` prefix (1-based, from the caller's order)
+// guarantees uniqueness even when two tracks share a display name, and keeps a
+// stable, chronological ordering when the archive is unpacked. `who` falls back
+// to the peer id when no display name is known; `source` is appended only when
+// it isn't plain voice, so mic tracks stay clean.
+export function trackFileName(
+  meta: { peerId: string; label?: string; source?: string },
+  index: number,
+): string {
+  const raw = meta.label?.trim() || meta.peerId;
+  const who =
+    raw
+      .replace(/[^a-zA-Z0-9_-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40) || "track";
+  const src = meta.source && meta.source !== "voice" ? `-${meta.source}` : "";
+  const n = String(index + 1).padStart(2, "0");
+  return `${n}-${who}${src}.ogg`;
+}

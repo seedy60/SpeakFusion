@@ -45,6 +45,10 @@
   "controls_download_active_title": "Download everything recorded so far (recording keeps going)",
   "controls_download_title": "Download the recording",
   "controls_download": "Download",
+  "controls_download_tracks_recording": "Download separate tracks",
+  "controls_download_tracks_active_title": "Download each participant's track as its own file in a zip (recording keeps going)",
+  "controls_download_tracks_title": "Download each participant's track as its own file in a zip",
+  "controls_download_tracks": "Tracks",
   "controls_leave_room": "Leave room",
   "controls_leave": "Leave",
 

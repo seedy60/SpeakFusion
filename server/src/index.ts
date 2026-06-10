@@ -1,5 +1,6 @@
 import express from "express";
 import { createServer } from "node:http";
+import { createReadStream } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createWorker } from "mediasoup";
@@ -8,6 +9,7 @@ import { workerSettings, numWorkers } from "./mediasoup-config.js";
 import { setWorkers } from "./room-manager.js";
 import { createSignalingServer } from "./signaling.js";
 import { RecordingManager } from "./recording.js";
+import { createZipStream } from "./zip-stream.js";
 
 const PORT = parseInt(process.env.PORT || "3100", 10);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -84,6 +86,34 @@ async function main() {
     proc.on("exit", (code) => {
       if (code) console.error(`[mix] ffmpeg exited with code ${code}`);
     });
+  });
+
+  // Per-track download — packs each participant's captured audio into its own
+  // file inside one streamed .zip (no mixing). Includes tracks whose peer
+  // already left, since their captures are kept on disk. Like the mix above,
+  // works while still recording and never interrupts the live captures.
+  app.get("/api/recordings/:id/tracks", (req, res) => {
+    const tracks = recordingManager.tracksByRecordingId(req.params.id);
+    if (!tracks || tracks.length === 0) {
+      res.status(404).json({ error: "No recording with that id, or nothing captured yet" });
+      return;
+    }
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="sonicroom-${req.params.id}-tracks.zip"`,
+    );
+
+    const zip = createZipStream(
+      tracks.map((t) => ({ name: t.name, open: () => createReadStream(t.path) })),
+    );
+    zip.on("error", (err) => {
+      console.error(`[tracks] zip error: ${String(err)}`);
+      res.destroy(err instanceof Error ? err : new Error(String(err)));
+    });
+    // If the client aborts the download, stop reading the files.
+    res.on("close", () => zip.destroy());
+    zip.pipe(res);
   });
 
   // Serve built client in production

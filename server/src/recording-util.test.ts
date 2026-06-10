@@ -9,6 +9,7 @@ import {
   buildMixArgs,
   decideMode,
   computeDelayMs,
+  trackFileName,
 } from "./recording-util.js";
 
 describe("PortAllocator", () => {
@@ -219,5 +220,33 @@ describe("computeDelayMs", () => {
 
   it("clamps negative offsets to zero", () => {
     assert.equal(computeDelayMs(5000, 4000), 0);
+  });
+});
+
+describe("trackFileName", () => {
+  it("uses a 1-based index prefix and the display name", () => {
+    assert.equal(trackFileName({ peerId: "x", label: "Alice" }, 0), "01-Alice.ogg");
+    assert.equal(trackFileName({ peerId: "x", label: "Bob" }, 1), "02-Bob.ogg");
+  });
+
+  it("appends the source only when it isn't plain voice", () => {
+    assert.equal(trackFileName({ peerId: "x", label: "Al", source: "voice" }, 0), "01-Al.ogg");
+    assert.equal(trackFileName({ peerId: "x", label: "Al", source: "share" }, 0), "01-Al-share.ogg");
+    assert.equal(trackFileName({ peerId: "x", label: "Eco", source: "music" }, 2), "03-Eco-music.ogg");
+  });
+
+  it("falls back to the peer id when there is no label", () => {
+    assert.equal(trackFileName({ peerId: "sock-42" }, 0), "01-sock-42.ogg");
+    assert.equal(trackFileName({ peerId: "sock-42", label: "   " }, 0), "01-sock-42.ogg");
+  });
+
+  it("sanitizes names and stays unique via the index prefix", () => {
+    // same display name, different index -> still distinct files
+    assert.equal(trackFileName({ peerId: "a", label: "DJ / Río!" }, 0), "01-DJ_R_o.ogg");
+    assert.equal(trackFileName({ peerId: "b", label: "DJ / Río!" }, 1), "02-DJ_R_o.ogg");
+  });
+
+  it("never yields an empty base name", () => {
+    assert.equal(trackFileName({ peerId: "???", label: "***" }, 0), "01-track.ogg");
   });
 });

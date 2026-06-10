@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/fasttalk
+WorkingDirectory=/home/sonicroom
 ExecStart=/usr/bin/pnpm start
 Restart=on-failure
 RestartSec=3
@@ -18,7 +18,7 @@ Environment=NODE_ENV=production
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/home/fasttalk
+ReadWritePaths=/home/sonicroom
 ProtectHome=read-only
 PrivateTmp=true
 

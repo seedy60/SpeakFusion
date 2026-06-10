@@ -66,9 +66,37 @@ const ICE_SERVERS: RTCIceServer[] = [
   },
 ];
 
-// Shared AudioContext — single output buffer for all peers (lower latency than one per peer)
+// iOS/iPadOS Safari (iPadOS now reports as "MacIntel" + touch). WebKit's audio
+// stack is behind the "sample rate keeps breaking" reports: it fights a forced
+// AudioContext/getUserMedia sample rate that doesn't match the current hardware
+// route, and it drops the whole context into an "interrupted" state on any route
+// change (Bluetooth/headset connect, the session flipping to voice-chat when a
+// peer joins, Siri, backgrounding).
+const isIOS =
+  typeof navigator !== "undefined" &&
+  (/iP(hone|ad|od)/.test(navigator.userAgent) ||
+    // iPadOS 13+ reports a desktop "Macintosh" UA; a touch-capable Mac is one.
+    (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1));
+
+// Mic constraints. On iOS we drop the sample-rate hint: forcing a rate the
+// current route can't honour (e.g. a Bluetooth headset locked to 16 kHz) yields
+// garbled/pitched capture. WebRTC/Opus negotiates its own rate regardless.
+function micConstraints(channelCount: 1 | 2): MediaTrackConstraints {
+  return {
+    channelCount,
+    ...(isIOS ? {} : { sampleRate: 48000 }),
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+  };
+}
+
+// Shared AudioContext — single output buffer for all peers (lower latency than
+// one per peer). On iOS we let it adopt the device-native rate instead of pinning
+// 48 kHz, so WebKit doesn't resample/fight the hardware on every route change;
+// other browsers honour the pin cleanly.
 const sharedAudioContext = new AudioContext({
-  sampleRate: 48000,
+  ...(isIOS ? {} : { sampleRate: 48000 }),
   latencyHint: "interactive",
 });
 
@@ -86,14 +114,25 @@ const GAIN_RAMP = 0.03;
 // fast attack. Adds ~5 ms of look-ahead latency, negligible for voice.
 const MIC_LIMITER = { threshold: -3, knee: 0, ratio: 20, attack: 0.003, release: 0.25 };
 
-// Resume shared context on first user interaction (iOS requirement)
+// Keep the shared context running. iOS needs a user gesture to start it, and it
+// also drops to "suspended" or the WebKit-only "interrupted" state whenever the
+// audio route changes / the tab backgrounds — and without re-resuming, audio dies
+// until a reload (this is what "keeps fucking up" mid-call). So we resume on the
+// first AND every gesture, on each statechange, and when the tab refocuses.
 function resumeSharedContext() {
-  if (sharedAudioContext.state === "suspended") {
-    sharedAudioContext.resume();
+  const state = sharedAudioContext.state as string;
+  if (state === "suspended" || state === "interrupted") {
+    // iOS rejects resume() while still interrupted (e.g. mid phone call); the
+    // statechange/visibility/gesture retries pick it up once it's allowed again.
+    sharedAudioContext.resume().catch(() => {});
   }
 }
-document.addEventListener("touchstart", resumeSharedContext, { once: true });
-document.addEventListener("click", resumeSharedContext, { once: true });
+document.addEventListener("touchstart", resumeSharedContext);
+document.addEventListener("click", resumeSharedContext);
+sharedAudioContext.addEventListener("statechange", resumeSharedContext);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resumeSharedContext();
+});
 
 function createAudioPipeline(track: MediaStreamTrack): Omit<PeerAudio, "consumer"> {
   const stream = new MediaStream([track]);
@@ -271,13 +310,7 @@ export function useMediasoup() {
 
     // Re-acquire mic
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        sampleRate: 48000,
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
+      audio: micConstraints(1),
     });
     localStreamRef.current = stream;
     connectMicToGraph(stream);
@@ -451,6 +484,11 @@ export function useMediasoup() {
       },
       codec: device.rtpCapabilities.codecs?.find((c) => c.mimeType.toLowerCase() === "audio/opus"),
       appData: { source: "share" },
+      // shareDest is an app-owned, long-lived Web Audio track reused across the
+      // session; mediasoup-client must NOT stop it when this producer closes
+      // (default stopTracks:true would kill it, so a later re-produce sends a
+      // dead track and no RTP flows).
+      stopTracks: false,
     });
   }, []);
 
@@ -556,6 +594,11 @@ export function useMediasoup() {
           opusMaxPlaybackRate: 48000,
         },
         codec: device.rtpCapabilities.codecs?.find((c) => c.mimeType.toLowerCase() === "audio/opus"),
+        // outDest is an app-owned, long-lived Web Audio track reused for the
+        // whole session and across P2P↔SFU switches; mediasoup-client must NOT
+        // stop it when this producer closes (default stopTracks:true would kill
+        // it, so the next produce sends a dead track and no RTP flows).
+        stopTracks: false,
       });
       producerRef.current = producer;
 
@@ -574,13 +617,7 @@ export function useMediasoup() {
       // track are reused for the whole session and survive reconnects, so a
       // network blip never re-prompts for the mic or rebuilds the send chain.
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 2,
-          sampleRate: 48000,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
+        audio: micConstraints(2),
       });
       localStreamRef.current = stream;
       connectMicToGraph(stream);

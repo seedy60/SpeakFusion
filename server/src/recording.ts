@@ -11,6 +11,7 @@ import {
   buildCaptureArgs,
   buildMixArgs,
   computeDelayMs,
+  trackFileName,
   type MixInput,
 } from "./recording-util.js";
 
@@ -80,17 +81,32 @@ export interface RecordingDeps {
 export interface ProducerInfo {
   producerId: string;
   peerId: string;
+  // Display name of the producing peer and the track's source ("voice" |
+  // "music" | "share"), if known. Purely cosmetic — used to name the files in
+  // the per-track download. Captured up front so a left peer's track keeps its
+  // name even after the peer is gone.
+  label?: string;
+  source?: string;
 }
 
 interface ProducerRecorder {
   producerId: string;
   peerId: string;
+  label?: string;
+  source?: string;
   port: number;
   filePath: string;
   startedAt: number;
   transport: RtpPlainTransport;
   consumer: RtpConsumer;
   ffmpeg: SpawnedProcess;
+}
+
+// One captured track in the per-track download: the on-disk file and the name
+// it should carry inside the zip.
+export interface TrackFile {
+  path: string;
+  name: string;
 }
 
 export type RecordingStatus = "recording" | "finished";
@@ -101,6 +117,11 @@ export interface RoomRecording {
   startedAt: number;
   router: RecordingRouter;
   recorders: Map<string, ProducerRecorder>;
+  // Recorders whose producer went away mid-recording (peer left, stopped
+  // sharing, etc.). Their capture is stopped and the file kept on disk so the
+  // already-recorded audio is still part of the mix and the per-track download
+  // — we never drop a track just because its peer left before the end.
+  closedRecorders: ProducerRecorder[];
   status: RecordingStatus;
   ttlHandle: unknown;
   closing: boolean;
@@ -190,6 +211,7 @@ export class RecordingManager {
       startedAt,
       router,
       recorders: new Map(),
+      closedRecorders: [],
       status: "recording",
       ttlHandle: null,
       closing: false,
@@ -213,25 +235,56 @@ export class RecordingManager {
   }
 
   // Stop capturing a single producer (it closed / its peer left). The already
-  // captured audio stays on disk so it's still included in downloads. No-op
-  // once a recording is finished (its files must be preserved for download).
+  // captured audio stays on disk AND in the recording (moved to closedRecorders)
+  // so it's still included in the mix and the per-track download. No-op once a
+  // recording is finished (its files must be preserved for download).
   async removeProducer(roomName: string, producerId: string): Promise<void> {
     const rec = this.recordings.get(roomName);
     if (!rec || rec.status !== "recording") return;
     const recorder = rec.recorders.get(producerId);
     if (!recorder) return;
     rec.recorders.delete(producerId);
+    rec.closedRecorders.push(recorder);
     this.stopRecorder(recorder);
   }
 
-  // Current per-producer files with their start offsets, for mixing.
+  // Every recorder that belongs to this recording — still-live ones plus those
+  // whose producer left — in chronological (start) order.
+  private allRecorders(rec: RoomRecording): ProducerRecorder[] {
+    return [...rec.recorders.values(), ...rec.closedRecorders].sort(
+      (a, b) => a.startedAt - b.startedAt,
+    );
+  }
+
+  // Current per-producer files with their start offsets, for mixing. Includes
+  // producers that already left — their captured audio is still part of the mix.
   getMixInputs(roomName: string): MixInput[] {
     const rec = this.recordings.get(roomName);
     if (!rec) return [];
-    return Array.from(rec.recorders.values()).map((r) => ({
+    return this.allRecorders(rec).map((r) => ({
       path: r.filePath,
       delayMs: computeDelayMs(rec.startedAt, r.startedAt),
     }));
+  }
+
+  // Per-track files (live + already-left producers) with friendly, unique names
+  // for the "download every track on its own" zip. Empty/missing captures (a
+  // recorder that failed to start) are skipped so the zip has no dead entries.
+  getTrackFiles(roomName: string): TrackFile[] {
+    const rec = this.recordings.get(roomName);
+    if (!rec) return [];
+    return this.allRecorders(rec)
+      .map((r, i) => ({ path: r.filePath, name: trackFileName(r, i) }))
+      .filter((t) => this.deps.fileSize(t.path) > 0);
+  }
+
+  // Same as getTrackFiles(), addressed by the (hard-to-guess) recording id that
+  // the download URL carries. Works for active and finished recordings.
+  tracksByRecordingId(recordingId: string): TrackFile[] | null {
+    for (const [roomName, rec] of this.recordings) {
+      if (rec.id === recordingId) return this.getTrackFiles(roomName);
+    }
+    return null;
   }
 
   // Spawn a one-shot ffmpeg that mixes the current capture files into a single
@@ -358,6 +411,8 @@ export class RecordingManager {
       rec.recorders.set(info.producerId, {
         producerId: info.producerId,
         peerId: info.peerId,
+        label: info.label,
+        source: info.source,
         port,
         filePath,
         startedAt: deps.now(),

@@ -264,6 +264,78 @@ describe("RecordingManager.addProducer / removeProducer", () => {
     assert.equal(p1Proc.killed, true);
     assert.equal(p1Proc.lastSignal, "SIGINT");
   });
+
+  it("keeps a left producer's track in the mix and per-track inputs", async () => {
+    await h.manager.start("room1", h.router, PRODUCERS);
+    await h.manager.removeProducer("room1", "p1"); // alice leaves mid-recording
+
+    // alice's already-captured audio is still part of the recording, even
+    // though her producer is gone (closedRecorders, not dropped).
+    const mixInputs = h.manager.getMixInputs("room1");
+    assert.equal(mixInputs.length, 2);
+    assert.ok(mixInputs.some((i) => i.path.includes("alice__p1")));
+    assert.ok(mixInputs.some((i) => i.path.includes("bob__p2")));
+
+    const tracks = h.manager.getTrackFiles("room1");
+    assert.equal(tracks.length, 2);
+    assert.ok(tracks.some((t) => t.path.includes("alice__p1")));
+  });
+});
+
+describe("RecordingManager.getTrackFiles / tracksByRecordingId", () => {
+  let h: Harness;
+  beforeEach(() => {
+    h = makeHarness();
+  });
+
+  it("lists one friendly, ordered file per captured track", async () => {
+    h.clock.t = 1000;
+    const rec = await h.manager.start("room1", h.router, [
+      { producerId: "p1", peerId: "sock-alice", label: "Alice" },
+    ]);
+    h.clock.t = 5000;
+    await h.manager.addProducer("room1", {
+      producerId: "p2",
+      peerId: "sock-bob",
+      label: "Bob",
+      source: "share",
+    });
+
+    const tracks = h.manager.getTrackFiles("room1");
+    assert.deepEqual(
+      tracks.map((t) => t.name),
+      ["01-Alice.ogg", "02-Bob-share.ogg"],
+    );
+    // names map onto the right on-disk files
+    assert.ok(tracks[0].path.startsWith(rec.dir));
+    assert.ok(tracks[0].path.includes("sock-alice__p1"));
+    assert.ok(tracks[1].path.includes("sock-bob__p2"));
+  });
+
+  it("falls back to the peer id when no display name is known", async () => {
+    await h.manager.start("room1", h.router, [{ producerId: "p1", peerId: "alice" }]);
+    const tracks = h.manager.getTrackFiles("room1");
+    assert.deepEqual(
+      tracks.map((t) => t.name),
+      ["01-alice.ogg"],
+    );
+  });
+
+  it("skips tracks whose capture file is missing/empty", async () => {
+    const rec = await h.manager.start("room1", h.router, PRODUCERS);
+    h.missingFiles.add(`${rec.dir}/bob__p2.ogg`);
+    const tracks = h.manager.getTrackFiles("room1");
+    assert.equal(tracks.length, 1);
+    assert.ok(tracks[0].path.includes("alice__p1"));
+  });
+
+  it("resolves an active or finished recording by its id", async () => {
+    const rec = await h.manager.start("room1", h.router, PRODUCERS);
+    assert.equal(h.manager.tracksByRecordingId(rec.id)?.length, 2);
+    await h.manager.finalize("room1");
+    assert.equal(h.manager.tracksByRecordingId(rec.id)?.length, 2);
+    assert.equal(h.manager.tracksByRecordingId("nope"), null);
+  });
 });
 
 describe("RecordingManager.mix", () => {

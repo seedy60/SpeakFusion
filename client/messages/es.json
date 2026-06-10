@@ -45,6 +45,10 @@
   "controls_download_active_title": "Descarga todo lo grabado hasta ahora (la grabación continúa)",
   "controls_download_title": "Descargar la grabación",
   "controls_download": "Descargar",
+  "controls_download_tracks_recording": "Descargar pistas por separado",
+  "controls_download_tracks_active_title": "Descarga la pista de cada participante como un archivo propio en un zip (la grabación continúa)",
+  "controls_download_tracks_title": "Descarga la pista de cada participante como un archivo propio en un zip",
+  "controls_download_tracks": "Pistas",
   "controls_leave_room": "Salir de la sala",
   "controls_leave": "Salir",
 

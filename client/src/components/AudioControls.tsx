@@ -1,5 +1,15 @@
 import { useRef, useState, type KeyboardEvent } from "react";
-import { Mic, MicOff, LogOut, ScreenShare, ScreenShareOff, Circle, Square, Download } from "lucide-react";
+import {
+  Mic,
+  MicOff,
+  LogOut,
+  ScreenShare,
+  ScreenShareOff,
+  Circle,
+  Square,
+  Download,
+  FileArchive,
+} from "lucide-react";
 import { useRoomStore } from "../stores/room";
 import { m } from "../paraglide/messages.js";
 
@@ -26,7 +36,13 @@ export function AudioControls({
   const itemRefs = useRef(new Map<string, HTMLElement>());
   const [activeId, setActiveId] = useState("mute");
 
-  const orderedIds = ["mute", "share", "record", ...(recordingId ? ["download"] : []), "leave"];
+  const orderedIds = [
+    "mute",
+    "share",
+    "record",
+    ...(recordingId ? ["download", "download-tracks"] : []),
+    "leave",
+  ];
   // If the active control vanished (e.g. the download link), fall back to the first.
   const effectiveActiveId = orderedIds.includes(activeId) ? activeId : orderedIds[0];
 
@@ -129,6 +145,24 @@ export function AudioControls({
         >
           <Download className="h-4 w-4" />
           <span className="text-sm font-medium">{m.controls_download()}</span>
+        </a>
+      )}
+
+      {recordingId && (
+        <a
+          {...item("download-tracks")}
+          href={`/api/recordings/${encodeURIComponent(recordingId)}/tracks`}
+          download={`sonicroom-${recordingId}-tracks.zip`}
+          className="flex h-11 items-center gap-2 rounded-full bg-sonic-700 px-4 text-sonic-200 transition-all hover:bg-sonic-600"
+          aria-label={m.controls_download_tracks_recording()}
+          title={
+            isRecording
+              ? m.controls_download_tracks_active_title()
+              : m.controls_download_tracks_title()
+          }
+        >
+          <FileArchive className="h-4 w-4" />
+          <span className="text-sm font-medium">{m.controls_download_tracks()}</span>
         </a>
       )}
 
