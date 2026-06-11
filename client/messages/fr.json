@@ -117,5 +117,8 @@
   "announce_share_started": "{name} a commencé à partager de l'audio",
   "announce_share_stopped": "{name} a arrêté de partager de l'audio",
   "announce_share_started_you": "Vous avez commencé à partager de l'audio",
-  "announce_share_stopped_you": "Vous avez arrêté de partager de l'audio"
+  "announce_share_stopped_you": "Vous avez arrêté de partager de l'audio",
+  "announce_music_started": "{name} a commencé à diffuser de la musique",
+  "announce_music_stopped": "{name} a arrêté de diffuser de la musique",
+  "announce_chat_hint": "Appuyez sur Alt plus un chiffre de 1 à 0 pour entendre les dix derniers messages, même lorsque le panneau de discussion est fermé"
 }

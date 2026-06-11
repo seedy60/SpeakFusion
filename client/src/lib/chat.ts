@@ -19,9 +19,12 @@ export interface ChatMessage {
   sender: string;
   text: string;
   ts: number; // epoch ms
-  // Presence events rendered inline in the chat list. Absent = a normal chat
-  // message; "join"/"leave" use `sender` as the participant name and ignore text.
-  kind?: "join" | "leave";
+  // Room events rendered inline in the chat list. Absent = a normal chat
+  // message; "join"/"leave" use `sender` as the participant name and ignore
+  // text; "system" carries an already-localized event line in `text` (the
+  // announcement, snapshotted in the locale active when it happened) and
+  // ignores sender.
+  kind?: "join" | "leave" | "system";
 }
 
 // One RelativeTimeFormat per active locale (constructing them isn't free, and
@@ -56,6 +59,7 @@ export function formatMessage(msg: ChatMessage, now: number = Date.now()): strin
   const time = relativeTime(msg.ts, now);
   if (msg.kind === "join") return `${chat_joined({ name: msg.sender })}${META_SEP}${time}`;
   if (msg.kind === "leave") return `${chat_left({ name: msg.sender })}${META_SEP}${time}`;
+  if (msg.kind === "system") return `${msg.text}${META_SEP}${time}`;
   return chat_announcement({ sender: msg.sender, text: msg.text, time });
 }
 

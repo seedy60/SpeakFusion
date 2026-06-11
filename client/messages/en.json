@@ -117,5 +117,8 @@
   "announce_share_started": "{name} started sharing audio",
   "announce_share_stopped": "{name} stopped sharing audio",
   "announce_share_started_you": "You started sharing audio",
-  "announce_share_stopped_you": "You stopped sharing audio"
+  "announce_share_stopped_you": "You stopped sharing audio",
+  "announce_music_started": "{name} started casting music",
+  "announce_music_stopped": "{name} stopped casting music",
+  "announce_chat_hint": "Press Alt plus a number from 1 to 0 to hear the last ten messages, even while the chat panel is closed"
 }

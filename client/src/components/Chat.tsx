@@ -149,7 +149,9 @@ export function Chat({ onSend, onClose }: ChatProps) {
                 <span className="text-xs italic text-sonic-400">
                   {msg.kind === "join"
                     ? m.chat_joined({ name: msg.sender })
-                    : m.chat_left({ name: msg.sender })}
+                    : msg.kind === "leave"
+                      ? m.chat_left({ name: msg.sender })
+                      : msg.text}
                   {META_SEP}
                   {relativeTime(msg.ts, now)}
                 </span>

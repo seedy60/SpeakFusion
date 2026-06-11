@@ -114,6 +114,7 @@ interface RoomState {
   setSpeakerDeviceId: (deviceId: string) => void;
   setRecording: (recording: boolean, recordingId?: string | null) => void;
   announce: (message: string) => void;
+  announceEvent: (message: string) => void;
   addMessage: (message: ChatMessage) => void;
   addPeer: (peerId: string, displayName: string) => void;
   removePeer: (peerId: string) => void;
@@ -183,6 +184,29 @@ export const useRoomStore = create<RoomState>((set) => ({
       recordingId: recordingId !== undefined ? recordingId : s.recordingId,
     })),
   announce: (message) => set((s) => ({ announcement: message, announceSeq: s.announceSeq + 1 })),
+
+  // Room-event announcement (recording/share/music/mute…): speak it AND log it
+  // into the chat history as a "system" entry, so chat is the single timeline
+  // of everything that was ever announced (rule: announcements go to chat).
+  // Bare announce() stays reserved for re-reading chat content that is already
+  // in history (incoming messages, the Alt+number readback).
+  announceEvent: (message) =>
+    set((s) => {
+      const ts = Date.now();
+      const messages = [
+        ...s.messages,
+        {
+          id: `sys-evt-${ts}-${s.announceSeq + 1}`,
+          sender: "",
+          text: message,
+          ts,
+          kind: "system" as const,
+        },
+      ];
+      if (messages.length > CHAT_MESSAGES_MAX)
+        messages.splice(0, messages.length - CHAT_MESSAGES_MAX);
+      return { announcement: message, announceSeq: s.announceSeq + 1, messages };
+    }),
 
   addMessage: (message) =>
     set((s) => {

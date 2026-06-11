@@ -5,10 +5,13 @@ import type { Transport, Producer, Consumer } from "mediasoup-client/types";
 import { forceOpusParams } from "../lib/sdp-munger";
 import { applySpeakerToContext } from "../lib/audio-devices";
 import { playCue } from "../lib/sounds";
-import { formatMessage, RateLimiter, type ChatMessage } from "../lib/chat";
+import { formatMessage, RateLimiter, META_SEP, type ChatMessage } from "../lib/chat";
 import {
   announce_joined,
   announce_left,
+  announce_music_started,
+  announce_music_stopped,
+  announce_chat_hint,
   announce_a_participant,
   announce_recording_started,
   announce_recording_stopped,
@@ -226,6 +229,9 @@ export function useMediasoup() {
   // Local anti-spam guard for instant "thunk" feedback (the server enforces the
   // same 5-per-10s budget authoritatively).
   const chatLimiterRef = useRef(new RateLimiter());
+  // The first received chat message carries a one-time hint that Alt+1..0
+  // reads recent messages aloud even with the chat panel closed.
+  const chatHintGivenRef = useRef(false);
 
   const store = useRoomStore;
 
@@ -571,8 +577,17 @@ export function useMediasoup() {
       peerAudiosRef.current.set(peerId, { ...pipeline, consumer });
 
       // Flag a music-caster peer (e.g. Ecobox) so the UI shows it as a media
-      // source. Stereo is preserved end-to-end by createAudioPipeline.
-      if (source === "music") store.getState().setPeerMusic(peerId, true);
+      // source. Stereo is preserved end-to-end by createAudioPipeline. The
+      // first time we learn this peer casts music, announce + log it — a
+      // re-consume (mode switch / reconnect) finds isMusic already set, so it
+      // never re-announces.
+      if (source === "music") {
+        if (!store.getState().peers.get(peerId)?.isMusic) {
+          const name = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
+          store.getState().announceEvent(announce_music_started({ name }));
+        }
+        store.getState().setPeerMusic(peerId, true);
+      }
 
       // Start at the correct gain: respects deafen, and ducks immediately if a
       // voice is already active when this (music) producer joins.
@@ -928,6 +943,7 @@ export function useMediasoup() {
 
       socket.on("peer-left", ({ peerId }: { peerId: string }) => {
         const name = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
+        const wasMusic = !!store.getState().peers.get(peerId)?.isMusic;
         // Clean up P2P connection if any
         const pc = p2pConnectionsRef.current.get(peerId);
         if (pc) {
@@ -947,15 +963,21 @@ export function useMediasoup() {
           if (owner === peerId) removeShareStream(producerId);
         }
         store.getState().removePeer(peerId);
-        store.getState().announce(announce_left({ name }));
-        const leaveTs = Date.now();
-        store.getState().addMessage({
-          id: `sys-leave-${peerId}-${leaveTs}`,
-          sender: name,
-          text: "",
-          ts: leaveTs,
-          kind: "leave",
-        });
+        if (wasMusic) {
+          // A music caster (e.g. Ecobox) going away reads as the music
+          // stopping, not as a participant leaving.
+          store.getState().announceEvent(announce_music_stopped({ name }));
+        } else {
+          store.getState().announce(announce_left({ name }));
+          const leaveTs = Date.now();
+          store.getState().addMessage({
+            id: `sys-leave-${peerId}-${leaveTs}`,
+            sender: name,
+            text: "",
+            ts: leaveTs,
+            kind: "leave",
+          });
+        }
         playCue(sharedAudioContext, "leave");
       });
 
@@ -966,19 +988,19 @@ export function useMediasoup() {
         const s = store.getState();
         if (s.isRecording && s.recordingId === recordingId) return;
         s.setRecording(true, recordingId);
-        s.announce(announce_recording_started({ name: by }));
+        s.announceEvent(announce_recording_started({ name: by }));
       });
 
       socket.on("recording-stopped", () => {
         // Keep recordingId so the download link stays available after stopping.
         store.getState().setRecording(false);
-        store.getState().announce(announce_recording_stopped());
+        store.getState().announceEvent(announce_recording_stopped());
       });
 
       // The finished recording was cleaned up server-side (TTL) — drop the link.
       socket.on("recording-expired", () => {
         store.getState().setRecording(false, null);
-        store.getState().announce(announce_recording_unavailable());
+        store.getState().announceEvent(announce_recording_unavailable());
       });
 
       // P2P signaling relay
@@ -1128,7 +1150,7 @@ export function useMediasoup() {
       socket.on(
         "share-started",
         ({ displayName: name }: { peerId: string; displayName: string }) => {
-          store.getState().announce(announce_share_started({ name }));
+          store.getState().announceEvent(announce_share_started({ name }));
           playCue(sharedAudioContext, "share-start");
         },
       );
@@ -1141,7 +1163,7 @@ export function useMediasoup() {
           for (const [producerId, owner] of shareOwnersRef.current) {
             if (owner === peerId) removeShareStream(producerId);
           }
-          store.getState().announce(announce_share_stopped({ name }));
+          store.getState().announceEvent(announce_share_stopped({ name }));
           playCue(sharedAudioContext, "share-stop");
         },
       );
@@ -1158,7 +1180,14 @@ export function useMediasoup() {
       // a distinct cue, and announce it on the polite ARIA region.
       socket.on("chat-message", (msg: ChatMessage) => {
         store.getState().addMessage(msg);
-        store.getState().announce(formatMessage(msg, Date.now()));
+        let announcement = formatMessage(msg, Date.now());
+        // First message of the session: tell SR users once that Alt+1..0 reads
+        // the recent messages aloud even while the chat panel is closed.
+        if (!chatHintGivenRef.current) {
+          chatHintGivenRef.current = true;
+          announcement += `${META_SEP}${announce_chat_hint()}`;
+        }
+        store.getState().announce(announcement);
         playCue(sharedAudioContext, "message");
       });
 
@@ -1194,7 +1223,7 @@ export function useMediasoup() {
     }
     await emit("producer-pause", {}).catch(() => {});
     store.getState().setMuted(true);
-    store.getState().announce(announce_mic_muted());
+    store.getState().announceEvent(announce_mic_muted());
     playCue(sharedAudioContext, "mute");
   }, [emit, store]);
 
@@ -1207,7 +1236,7 @@ export function useMediasoup() {
     }
     await emit("producer-resume", {}).catch(() => {});
     store.getState().setMuted(false);
-    store.getState().announce(announce_mic_unmuted());
+    store.getState().announceEvent(announce_mic_unmuted());
     playCue(sharedAudioContext, "unmute");
   }, [emit, store]);
 
@@ -1269,7 +1298,7 @@ export function useMediasoup() {
     // and close the server-side producer so peers' tiles disappear.
     await emit("stop-share").catch(() => {});
     // Local feedback; peers get theirs via the share-stopped broadcast.
-    store.getState().announce(announce_share_stopped_you());
+    store.getState().announceEvent(announce_share_stopped_you());
     playCue(sharedAudioContext, "share-stop");
   }, [store, detachSharedAudio, emit]);
 
@@ -1336,7 +1365,7 @@ export function useMediasoup() {
     if (wasSfu) await produceShare();
 
     // Local feedback; peers get theirs via the share-started broadcast.
-    store.getState().announce(announce_share_started_you());
+    store.getState().announceEvent(announce_share_started_you());
     playCue(sharedAudioContext, "share-start");
   }, [store, ensureOutGraph, stopAudioShare, produceShare, emit]);
 
@@ -1356,7 +1385,7 @@ export function useMediasoup() {
       store.getState().setRecording(true, res.recordingId);
     } catch (err) {
       console.error("[recording] failed to start:", err);
-      store.getState().announce(announce_recording_failed());
+      store.getState().announceEvent(announce_recording_failed());
     }
   }, [emit, store]);
 
