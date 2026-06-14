@@ -15,6 +15,8 @@ import {
 import { decideMode } from "./recording-util.js";
 import { RateLimiter, CHAT_HISTORY_MAX, CHAT_TEXT_MAX, type ChatMessage } from "./chat-util.js";
 import type { RecordingManager, ProducerInfo } from "./recording.js";
+import type { StreamManager } from "./streaming.js";
+import type { IcecastConfig } from "./streaming-util.js";
 
 // --- Validation schemas ---
 const roomNameSchema = z
@@ -36,6 +38,31 @@ const chatTextSchema = z
   .string()
   .transform((s) => s.trim())
   .pipe(z.string().min(1, "Message is empty").max(CHAT_TEXT_MAX));
+
+// Icecast target supplied by whoever starts streaming. Host/mount are charset-
+// restricted so the icecast:// URL stays well-formed (the password/username are
+// percent-encoded in buildIcecastUrl, so they may contain anything). The config
+// is only ever used to start the server's own ffmpeg — it's never broadcast to
+// other peers (the password would leak), only `streaming-started { by }` is.
+const icecastConfigSchema = z.object({
+  host: z
+    .string()
+    .min(1)
+    .max(255)
+    .regex(/^[a-zA-Z0-9.-]+$/, "Host must be a hostname or IPv4 address"),
+  port: z.number().int().min(1).max(65535),
+  mount: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^\/?[a-zA-Z0-9._/-]+$/, "Invalid mount point")
+    .transform((m) => (m.startsWith("/") ? m : `/${m}`)),
+  username: z.string().min(1).max(128).default("source"),
+  password: z.string().min(1).max(256),
+  format: z.enum(["mp3", "opus"]).default("mp3"),
+  bitrateKbps: z.number().int().min(32).max(320).default(160),
+  name: z.string().max(128).optional(),
+});
 
 const joinSchema = z.object({
   roomName: roomNameSchema,
@@ -62,7 +89,11 @@ function closeSfuResources(peer: Peer) {
   peer.consumers.clear();
 }
 
-export function createSignalingServer(httpServer: HttpServer, recordingManager: RecordingManager) {
+export function createSignalingServer(
+  httpServer: HttpServer,
+  recordingManager: RecordingManager,
+  streamManager: StreamManager,
+) {
   const io = new Server(httpServer, {
     cors: { origin: "*" },
     transports: ["websocket"],
@@ -74,6 +105,15 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
   // clients can hide the now-dead download link.
   recordingManager.onExpire = (roomName, recordingId) => {
     io.to(roomName).emit("recording-expired", { recordingId });
+  };
+
+  // The mixer ffmpeg died on its own (bad Icecast target, server unreachable,
+  // mount already in use, …). Tell the room the stream stopped and re-evaluate
+  // the mode (streaming no longer pins SFU).
+  streamManager.onStop = (roomName, _reason, message) => {
+    io.to(roomName).emit("streaming-failed", { error: message });
+    const room = getRooms().get(roomName);
+    if (room) applyModeDecision(room);
   };
 
   // Anti-spam: 5 messages / 10s per sender. Keyed by socket id for in-room
@@ -131,6 +171,7 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
   function shouldForceSfu(room: Room): boolean {
     return (
       recordingManager.isRecording(room.name) ||
+      streamManager.isStreaming(room.name) ||
       room.casters.size > 0 ||
       room.sharers.size > 0 ||
       room.disableP2p
@@ -248,6 +289,9 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
           recording: recordingManager.isRecording(room.name)
             ? { recordingId: recordingManager.getRecording(room.name)!.id }
             : null,
+          // Whether the room is being streamed live to Icecast (room-wide, like
+          // recording). The Icecast target itself is never shared.
+          streaming: streamManager.isStreaming(room.name),
           // Whether someone is talking RIGHT NOW, so a late joiner starts
           // music peers ducked instead of waiting for the next transition.
           voiceActive: room.voiceActive,
@@ -395,18 +439,25 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
             .catch((err) => console.error("[duck] addProducer failed:", err));
         }
 
-        // If the room is being recorded, start capturing this producer too.
-        // Not awaited — the produce callback should return promptly, and the
-        // recorder spins up in the background.
+        // If the room is being recorded and/or streamed, tap this producer for
+        // each too. Not awaited — the produce callback should return promptly,
+        // and the recorder/feed spins up in the background. Recording and
+        // streaming each consume the producer independently.
+        const producerInfo: ProducerInfo = {
+          producerId: producer.id,
+          peerId: socket.id,
+          label: currentPeer.displayName,
+          source: source ?? "voice",
+        };
         if (recordingManager.isRecording(currentRoom.name)) {
           void recordingManager
-            .addProducer(currentRoom.name, {
-              producerId: producer.id,
-              peerId: socket.id,
-              label: currentPeer.displayName,
-              source: source ?? "voice",
-            })
+            .addProducer(currentRoom.name, producerInfo)
             .catch((err) => console.error("[recording] addProducer failed:", err));
+        }
+        if (streamManager.isStreaming(currentRoom.name)) {
+          void streamManager
+            .addProducer(currentRoom.name, producerInfo)
+            .catch((err) => console.error("[streaming] addProducer failed:", err));
         }
 
         // Notify all other peers that a new producer is available
@@ -470,6 +521,11 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
       for (const producer of currentPeer.producers.values()) {
         if (((producer.appData?.source as string) ?? "voice") !== "voice") continue;
         await producer.pause();
+        // A paused producer sends no RTP, which would stall the live mixer's
+        // amix — drop it from the stream (kept allocated) until it resumes.
+        if (currentRoom && streamManager.isStreaming(currentRoom.name)) {
+          streamManager.setProducerActive(currentRoom.name, producer.id, false);
+        }
       }
       if (currentRoom) {
         socket.to(currentRoom.name).emit("peer-muted", { peerId: socket.id });
@@ -483,6 +539,10 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
       for (const producer of currentPeer.producers.values()) {
         if (((producer.appData?.source as string) ?? "voice") !== "voice") continue;
         await producer.resume();
+        // Voice is flowing again — fold this producer back into the live mix.
+        if (currentRoom && streamManager.isStreaming(currentRoom.name)) {
+          streamManager.setProducerActive(currentRoom.name, producer.id, true);
+        }
       }
       if (currentRoom) {
         socket.to(currentRoom.name).emit("peer-unmuted", { peerId: socket.id });
@@ -514,10 +574,13 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         if ((producer.appData?.source as string) === "share") {
           producer.close();
           currentPeer.producers.delete(id);
-          // Also stop its capture if recording — otherwise the recorder's
-          // ffmpeg idles on a dead port until the recording ends.
+          // Also stop its capture/feed if recording/streaming — otherwise the
+          // recorder/mixer idles on a dead port until it ends.
           if (recordingManager.isRecording(currentRoom.name)) {
             void recordingManager.removeProducer(currentRoom.name, id).catch(() => {});
+          }
+          if (streamManager.isStreaming(currentRoom.name)) {
+            void streamManager.removeProducer(currentRoom.name, id).catch(() => {});
           }
         }
       }
@@ -592,6 +655,71 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
       }
     });
 
+    // --- Live streaming to Icecast (room-wide; forces SFU like recording) ---
+    // The starter supplies the Icecast target; the server runs the mixer ffmpeg.
+    // The config (incl. password) is NOT broadcast — only the fact that the room
+    // is now live, and by whom.
+    socket.on("start-streaming", async (data: unknown, cb: (res: unknown) => void) => {
+      try {
+        if (!currentRoom) {
+          cb({ ok: false, error: "Not in a room" });
+          return;
+        }
+        const room = currentRoom;
+
+        if (streamManager.isStreaming(room.name)) {
+          cb({ ok: true });
+          return;
+        }
+
+        const parsed = icecastConfigSchema.safeParse(data);
+        if (!parsed.success) {
+          cb({ ok: false, error: parsed.error.issues[0]?.message ?? "Invalid streaming settings" });
+          return;
+        }
+        const config: IcecastConfig = parsed.data;
+
+        // Snapshot producers that already exist (only present if already in
+        // SFU). In P2P there are none yet — applyModeDecision below forces SFU
+        // and each peer's `produce` then registers via addProducer.
+        const producers: ProducerInfo[] = [];
+        for (const [peerId, peer] of room.peers) {
+          for (const [producerId, producer] of peer.producers) {
+            const src = (producer.appData?.source as string) ?? "voice";
+            producers.push({ producerId, peerId, label: peer.displayName, source: src });
+          }
+        }
+
+        await streamManager.start(room.name, room.router, producers, config);
+        // Force SFU if we're in P2P so the server can see the media.
+        applyModeDecision(room);
+
+        io.to(room.name).emit("streaming-started", {
+          by: currentPeer?.displayName ?? "Someone",
+        });
+        cb({ ok: true });
+      } catch (err) {
+        cb({ ok: false, error: err instanceof Error ? err.message : "Failed to start streaming" });
+      }
+    });
+
+    socket.on("stop-streaming", async (_data: unknown, cb: (res: unknown) => void) => {
+      try {
+        if (!currentRoom) {
+          cb({ ok: false, error: "Not in a room" });
+          return;
+        }
+        const room = currentRoom;
+        await streamManager.stop(room.name);
+        io.to(room.name).emit("streaming-stopped", {});
+        // Streaming no longer pins SFU — fall back to P2P if <=2 peers remain.
+        applyModeDecision(room);
+        cb({ ok: true });
+      } catch (err) {
+        cb({ ok: false, error: err instanceof Error ? err.message : "Failed to stop streaming" });
+      }
+    });
+
     socket.on("disconnect", (reason) => {
       console.log(`[ws] disconnected: ${socket.id} (${reason})`);
       chatLimiter.forget(socket.id);
@@ -599,17 +727,26 @@ export function createSignalingServer(httpServer: HttpServer, recordingManager: 
         const room = currentRoom;
         socket.to(room.name).emit("peer-left", { peerId: socket.id });
 
-        // Stop capturing this peer's producers (the already-recorded audio
-        // stays on disk and is still included in downloads).
+        // Stop capturing/feeding this peer's producers (the already-recorded
+        // audio stays on disk and is still included in downloads).
         if (recordingManager.isRecording(room.name)) {
           for (const producerId of currentPeer.producers.keys()) {
             void recordingManager.removeProducer(room.name, producerId).catch(() => {});
           }
         }
+        if (streamManager.isStreaming(room.name)) {
+          for (const producerId of currentPeer.producers.keys()) {
+            void streamManager.removeProducer(room.name, producerId).catch(() => {});
+          }
+        }
         // If this was the last peer, the room is about to be destroyed — drop
-        // any recording (active or finished-but-downloadable) and its files.
+        // any recording (active or finished-but-downloadable) and its files,
+        // and tear down any live stream.
         if (room.peers.size <= 1 && recordingManager.getRecording(room.name)) {
           void recordingManager.discard(room.name).catch(() => {});
+        }
+        if (room.peers.size <= 1 && streamManager.isStreaming(room.name)) {
+          void streamManager.stop(room.name).catch(() => {});
         }
 
         // Drop this peer from the caster/sharer sets before removePeer (which

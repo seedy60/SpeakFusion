@@ -32,9 +32,10 @@ Run a single server test file / single test:
 pnpm --filter server exec node --import tsx --test src/recording-util.test.ts
 pnpm --filter server exec node --import tsx --test --test-name-pattern="PortAllocator" "src/**/*.test.ts"
 pnpm --filter client exec tsc --noEmit     # typecheck the client
+pnpm --filter server exec tsc --noEmit     # typecheck the server (it runs untyped via tsx, so this is the only type gate)
 ```
 
-Only the server is tested (pure logic in `recording-util.ts`); the client has no test setup.
+Only the server has tests (the client has none). They cover the pure helpers (`recording-util.ts`, `chat-util.ts`, `zip-stream.ts`, `streaming-util.ts`) **and** the stateful managers (`recording.ts`, `streaming.ts`): each manager takes injected deps (`RecordingDeps` / `StreamDeps`) so the tests drive it with fakes — a fake `spawn` (no real ffmpeg), structural mediasoup Router/Transport/Consumer, a fake clock and fake timers — asserting on the args/SDP/ports/lifecycle without launching a process or touching media.
 
 ## Architecture
 
@@ -67,6 +68,12 @@ A send-only "music caster" peer joins with `role: "caster"` (see `joinSchema`). 
 
 Recording is server-side and forces SFU. Per producer: a mediasoup `PlainTransport` pushes RTP to a local UDP port (`PortAllocator` hands out P/P+1 pairs since ffmpeg also opens an RTCP socket at port+1) where an ffmpeg process captures it to a streamable Ogg/Opus file with `-c:a copy` (no re-encode). The download endpoint (`/api/recordings/:id/download`) spawns a **second** ffmpeg that `amix`es all captures (with `adelay` to align late joiners, `normalize=0`) and streams to HTTP `pipe:1` — captures keep running, never interrupted. Recordings are keyed by a `recordingId` capability token, not room name. `RecordingManager` takes injected `RecordingDeps` so the logic is unit-testable without real ffmpeg/mediasoup.
 
+### Live Icecast streaming (`server/src/streaming.ts` + `streaming-util.ts`)
+
+`StreamManager` mirrors `RecordingManager` and is **independent of it** — both tap the SFU with their own consumers, so a room can record, stream, both, or neither. It also forces SFU. Per producer it has its own `PlainTransport`+consumer → local UDP port (its own `PortAllocator`, range **51000–51998**, distinct from recording's). One **live mixer ffmpeg per room** reads every active producer's RTP (via SDP files), `amix`es them (`normalize=0`) and pushes to `icecast://user:pass@host:port/mount` (`-c:a libmp3lame`/`-f mp3` or `libopus`/`-f ogg`). A permanent silent stereo **anchor** (`anullsrc`) keeps the Icecast source alive (streaming silence) when there are zero active producers. The Icecast target is supplied by whoever starts streaming (in-call **Streaming** settings panel, persisted in `localStorage`), validated by `icecastConfigSchema`, sent on `start-streaming`, and **never broadcast** — only `streaming-started { by }` / `streaming-stopped` / `streaming-failed` go to the room (state is room-wide, like recording: a `LIVE` badge + `announceEvent`).
+
+Key constraint: a **paused** producer (peer muted) sends no RTP and would stall `amix`, so the mixer is **rebuilt** (debounced, `rebuildDebounceMs`) whenever the _active_ producer set changes — join/leave/share/mute/unmute (`addProducer`/`removeProducer`/`setProducerActive`, wired in `signaling.ts`). Each rebuild kills+respawns the mixer, i.e. a brief Icecast source reconnect; configure an Icecast `<fallback-mount>` for seamless listening. `StreamManager` takes injected `StreamDeps` (reuses recording's structural mediasoup/process interfaces) so it's unit-testable without real ffmpeg/mediasoup.
+
 ### Screen-reader announcements (rule: announcements go to chat)
 
 Every room-**event** announcement (recording start/stop, audio-share start/stop, music caster start/stop, mute/unmute, …) must go through the store's `announceEvent()`, which speaks it on the ARIA live region in `Room.tsx` **and** appends it to the chat history as a `kind: "system"` entry — chat is the single timeline of everything announced, readable later via the panel or the Alt+1..0 readback. Peer join/leave keeps its dedicated `kind: "join"/"leave"` entries (localized at render time; `system` entries snapshot the locale active at event time). Bare `announce()` is reserved for re-reading chat content that is already in history: the incoming `chat-message` announcement (which appends a one-time Alt+number hint on the session's first message) and the Alt+number readback itself.
@@ -88,4 +95,4 @@ UI strings live in `client/messages/{en,es,fr}.json` (flat key→string, `{var}`
 
 - Runs under systemd as **`sonicroom.service`** (`ExecStart=/usr/bin/pnpm start`, `WorkingDirectory=/home/sonicroom`). Env: `PORT` (3100), `ANNOUNCED_IP` / `ANNOUNCED_IP6` (the VPS public IPs — required for ICE), `NODE_ENV=production`. Restart with `systemctl restart sonicroom`.
 - **Client changes need only `pnpm build`** — `express.static(client/dist)` serves the new bundle on the next page load, so no server restart and no dropped calls. **Restart the service only for server-code changes** (server runs TS live via tsx).
-- Ports: WebRTC media UDP **40000–40100**; recording RTP **50000–50998**. ICE is **UDP-only** by design; TCP/TLS fallback is handled by an external coturn (`turn.oriolgomez.com`). TURN credentials are in client code intentionally (WebRTC requires them browser-side).
+- Ports: WebRTC media UDP **40000–40100**; recording RTP **50000–50998**; Icecast-streaming RTP **51000–51998**. (The recording/streaming RTP ranges are loopback-only — mediasoup→ffmpeg on 127.0.0.1 — so no firewall change; only the outbound Icecast connection leaves the box.) ICE is **UDP-only** by design; TCP/TLS fallback is handled by an external coturn (`turn.oriolgomez.com`). TURN credentials are in client code intentionally (WebRTC requires them browser-side).

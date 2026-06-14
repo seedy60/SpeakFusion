@@ -41,6 +41,43 @@ function saveString(key: string, value: string) {
   }
 }
 
+// Icecast streaming target. Persisted (incl. password) so the user configures
+// it once and can re-stream without retyping — same "remember my settings"
+// treatment as the mic/speaker choice. Sent to the server on start-streaming
+// and never broadcast to other peers.
+export type StreamFormat = "mp3" | "opus";
+export interface StreamConfig {
+  host: string;
+  port: number;
+  mount: string;
+  username: string;
+  password: string;
+  format: StreamFormat;
+  bitrateKbps: number;
+}
+
+const STREAM_CONFIG_KEY = "sonicroom:streamConfig";
+
+export const DEFAULT_STREAM_CONFIG: StreamConfig = {
+  host: "",
+  port: 8000,
+  mount: "/sonicroom",
+  username: "source",
+  password: "",
+  format: "mp3",
+  bitrateKbps: 160,
+};
+
+function loadStreamConfig(): StreamConfig {
+  try {
+    const raw = localStorage.getItem(STREAM_CONFIG_KEY);
+    if (raw) return { ...DEFAULT_STREAM_CONFIG, ...(JSON.parse(raw) as Partial<StreamConfig>) };
+  } catch {
+    // Missing/corrupt/unavailable — fall back to defaults.
+  }
+  return { ...DEFAULT_STREAM_CONFIG };
+}
+
 export interface PeerState {
   peerId: string;
   displayName: string;
@@ -86,6 +123,16 @@ interface RoomState {
   isRecording: boolean;
   recordingId: string | null;
 
+  // Live Icecast streaming (room-wide, like recording — everyone sees it's
+  // live). `streamConfig` is this client's persisted Icecast target (the only
+  // place the password lives); `isStreaming` is the room-wide live state.
+  isStreaming: boolean;
+  streamConfig: StreamConfig;
+  // Last streaming failure reason (server-supplied), shown in the Streaming
+  // panel. Set when the server reports the stream died (bad target, unreachable,
+  // auth, …); cleared on a fresh start/stop. Null when there's nothing to show.
+  streamError: string | null;
+
   // Latest screen-reader announcement (peer join/leave, recording, etc.).
   // `announceSeq` changes on every announce() so React re-renders even when
   // the same message repeats.
@@ -113,6 +160,9 @@ interface RoomState {
   setMicDeviceId: (deviceId: string) => void;
   setSpeakerDeviceId: (deviceId: string) => void;
   setRecording: (recording: boolean, recordingId?: string | null) => void;
+  setStreaming: (streaming: boolean) => void;
+  setStreamConfig: (config: StreamConfig) => void;
+  setStreamError: (error: string | null) => void;
   announce: (message: string) => void;
   announceEvent: (message: string) => void;
   addMessage: (message: ChatMessage) => void;
@@ -142,6 +192,9 @@ export const useRoomStore = create<RoomState>((set) => ({
   speakerDeviceId: loadString(SPEAKER_DEVICE_KEY),
   isRecording: false,
   recordingId: null,
+  isStreaming: false,
+  streamConfig: loadStreamConfig(),
+  streamError: null,
   announcement: "",
   announceSeq: 0,
   peers: new Map(),
@@ -183,6 +236,16 @@ export const useRoomStore = create<RoomState>((set) => ({
       isRecording,
       recordingId: recordingId !== undefined ? recordingId : s.recordingId,
     })),
+  // Going live clears any stale failure from a previous attempt; a stop leaves
+  // the last error untouched (stopping doesn't surface one). streaming-failed
+  // sets the reason explicitly via setStreamError.
+  setStreaming: (isStreaming) =>
+    set(isStreaming ? { isStreaming, streamError: null } : { isStreaming }),
+  setStreamConfig: (streamConfig) => {
+    saveString(STREAM_CONFIG_KEY, JSON.stringify(streamConfig));
+    set({ streamConfig });
+  },
+  setStreamError: (streamError) => set({ streamError }),
   announce: (message) => set((s) => ({ announcement: message, announceSeq: s.announceSeq + 1 })),
 
   // Room-event announcement (recording/share/music/mute…): speak it AND log it
@@ -286,6 +349,9 @@ export const useRoomStore = create<RoomState>((set) => ({
       isSharingAudio: false,
       isRecording: false,
       recordingId: null,
+      // Keep streamConfig (a persisted preference); only the live state resets.
+      isStreaming: false,
+      streamError: null,
       announcement: "",
       announceSeq: 0,
       peers: new Map(),

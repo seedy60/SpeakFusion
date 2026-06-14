@@ -9,6 +9,7 @@ import { workerSettings, numWorkers } from "./mediasoup-config.js";
 import { setWorkers } from "./room-manager.js";
 import { createSignalingServer } from "./signaling.js";
 import { RecordingManager } from "./recording.js";
+import { StreamManager } from "./streaming.js";
 import { createZipStream } from "./zip-stream.js";
 
 const PORT = parseInt(process.env.PORT || "3100", 10);
@@ -33,7 +34,8 @@ async function main() {
   const httpServer = createServer(app);
 
   const recordingManager = new RecordingManager();
-  const { postChatMessage } = createSignalingServer(httpServer, recordingManager);
+  const streamManager = new StreamManager();
+  const { postChatMessage } = createSignalingServer(httpServer, recordingManager, streamManager);
 
   // Health check
   app.get("/health", (_req, res) => {
@@ -127,10 +129,13 @@ async function main() {
     console.log(`SonicRoom server listening on port ${PORT}`);
   });
 
-  // Clean up recordings (ffmpeg processes, temp files) on shutdown.
+  // Clean up recordings and live streams (ffmpeg processes, temp files) on
+  // shutdown.
   const shutdown = (signal: string) => {
-    console.log(`Received ${signal}, cleaning up recordings...`);
-    recordingManager.stopAll().finally(() => process.exit(0));
+    console.log(`Received ${signal}, cleaning up recordings and streams...`);
+    Promise.allSettled([recordingManager.stopAll(), streamManager.stopAll()]).finally(() =>
+      process.exit(0),
+    );
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));

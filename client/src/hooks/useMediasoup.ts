@@ -17,6 +17,10 @@ import {
   announce_recording_stopped,
   announce_recording_unavailable,
   announce_recording_failed,
+  announce_streaming_started,
+  announce_streaming_stopped,
+  announce_streaming_failed,
+  announce_streaming_failed_reason,
   announce_mic_muted,
   announce_mic_unmuted,
   announce_share_started,
@@ -812,6 +816,7 @@ export function useMediasoup() {
           }>;
           mode: RoomMode;
           recording: { recordingId: string } | null;
+          streaming?: boolean;
           voiceActive?: boolean;
           messages: ChatMessage[];
         }>("join", {
@@ -841,6 +846,8 @@ export function useMediasoup() {
             !!joinRes.recording,
             joinRes.recording ? joinRes.recording.recordingId : null,
           );
+        // Likewise the room-wide live-streaming state.
+        store.getState().setStreaming(!!joinRes.streaming);
 
         // Reconcile the peer list: drop anyone who left while we were
         // disconnected, add newcomers. addPeer resets per-peer state, so only
@@ -1001,6 +1008,33 @@ export function useMediasoup() {
       socket.on("recording-expired", () => {
         store.getState().setRecording(false, null);
         store.getState().announceEvent(announce_recording_unavailable());
+      });
+
+      // --- Live streaming (room-wide; the server forces SFU while streaming) ---
+      socket.on("streaming-started", ({ by }: { by: string }) => {
+        const s = store.getState();
+        if (s.isStreaming) return; // de-dupe near-simultaneous starts
+        s.setStreaming(true);
+        s.announceEvent(announce_streaming_started({ name: by }));
+      });
+
+      socket.on("streaming-stopped", () => {
+        if (!store.getState().isStreaming) return;
+        store.getState().setStreaming(false);
+        store.getState().announceEvent(announce_streaming_stopped());
+      });
+
+      // The server's mixer died on its own (bad Icecast target, unreachable, …).
+      // `error` is the server's already-classified, human-readable reason — keep
+      // it so the Streaming panel can show what to fix, and read it aloud.
+      socket.on("streaming-failed", ({ error }: { error?: string } = {}) => {
+        const s = store.getState();
+        s.setStreaming(false);
+        const reason = error?.trim() || "";
+        s.setStreamError(reason || null);
+        s.announceEvent(
+          reason ? announce_streaming_failed_reason({ reason }) : announce_streaming_failed(),
+        );
       });
 
       // P2P signaling relay
@@ -1406,6 +1440,45 @@ export function useMediasoup() {
     else await startRecording();
   }, [startRecording, stopRecording, store]);
 
+  // --- Live streaming to Icecast ---
+  // Like recording, this is server-side and room-wide: the server taps every
+  // participant's stream off the SFU, mixes it, and pushes it to the Icecast
+  // target supplied here. Starting it forces the room out of P2P. Throws (with
+  // the server's reason) so the settings UI can surface a bad target.
+  const startStreaming = useCallback(async () => {
+    if (store.getState().isStreaming) return;
+    store.getState().setStreamError(null); // drop any stale failure before retrying
+    const { host, port, mount, username, password, format, bitrateKbps } =
+      store.getState().streamConfig;
+    await emit("start-streaming", {
+      host: host.trim(),
+      port,
+      mount: mount.trim(),
+      username: username.trim() || "source",
+      password,
+      format,
+      bitrateKbps,
+    });
+    // The server also broadcasts streaming-started; reflect it immediately so
+    // the button flips without waiting for the echo.
+    store.getState().setStreaming(true);
+  }, [emit, store]);
+
+  const stopStreaming = useCallback(async () => {
+    if (!store.getState().isStreaming) return;
+    try {
+      await emit("stop-streaming");
+    } catch (err) {
+      console.error("[streaming] failed to stop:", err);
+    }
+    store.getState().setStreaming(false);
+  }, [emit, store]);
+
+  const toggleStreaming = useCallback(async () => {
+    if (store.getState().isStreaming) await stopStreaming();
+    else await startStreaming();
+  }, [startStreaming, stopStreaming, store]);
+
   // Live mic-gain control: persists the value and ramps the outgoing gain node.
   const setMicGain = useCallback(
     (gain: number) => {
@@ -1482,6 +1555,9 @@ export function useMediasoup() {
     toggleRecording,
     startRecording,
     stopRecording,
+    startStreaming,
+    stopStreaming,
+    toggleStreaming,
     setPeerVolume,
     setMicGain,
     sendChatMessage,
