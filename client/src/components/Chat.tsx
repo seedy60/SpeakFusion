@@ -1,29 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { useRoomStore } from "../stores/room";
-import { relativeTime, META_SEP, type ChatMessage } from "../lib/chat";
+import { relativeTime, messageContent, META_SEP } from "../lib/chat";
 import { m } from "../paraglide/messages.js";
-
-// What Ctrl+C copies: the message body only — no "sender:" prefix, no trailing
-// "sent …" time. Event rows copy their localized line (join/leave/system text).
-function messageContent(msg: ChatMessage): string {
-  if (msg.kind === "join") return m.chat_joined({ name: msg.sender });
-  if (msg.kind === "leave") return m.chat_left({ name: msg.sender });
-  return msg.text;
-}
 
 interface ChatProps {
   // Returns ok:false with a reason when nothing was sent, so we keep the text
   // in the box (the hook already played the "thunk" cue for rate_limited).
   onSend: (text: string) => Promise<{ ok: boolean; reason?: "empty" | "rate_limited" }>;
   onClose: () => void;
+  // Changes whenever the caller wants the composer (re)focused even though the
+  // panel is already open — e.g. handing focus back after the join modal closes.
+  focusSignal?: number;
 }
 
 // In-room chat. Order matters for accessibility: the message list (a listbox
 // you arrow through) comes BEFORE the composer, so screen-reader users land on
 // history first. New messages are announced and chimed elsewhere (the hook);
 // this panel is just the visible list + editor.
-export function Chat({ onSend, onClose }: ChatProps) {
+export function Chat({ onSend, onClose, focusSignal }: ChatProps) {
   const messages = useRoomStore((s) => s.messages);
   const announce = useRoomStore((s) => s.announce);
   const [text, setText] = useState("");
@@ -41,10 +36,11 @@ export function Chat({ onSend, onClose }: ChatProps) {
     return () => clearInterval(id);
   }, []);
 
-  // Drop focus into the composer when the panel opens.
+  // Drop focus into the composer when the panel opens, and again whenever the
+  // caller bumps focusSignal (e.g. the join modal just closed).
   useEffect(() => {
     textareaRef.current?.focus();
-  }, []);
+  }, [focusSignal]);
 
   // Keep the active option valid as messages arrive or clear.
   useEffect(() => {
@@ -75,7 +71,9 @@ export function Chat({ onSend, onClose }: ChatProps) {
       const msg = activeIdx >= 0 ? messages[activeIdx] : undefined;
       if (!msg) return;
       e.preventDefault();
-      void navigator.clipboard?.writeText(messageContent(msg)).then(() => announce(m.chat_copied()));
+      void navigator.clipboard
+        ?.writeText(messageContent(msg))
+        .then(() => announce(m.chat_copied()));
       return;
     }
 

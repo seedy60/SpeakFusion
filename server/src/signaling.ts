@@ -13,6 +13,7 @@ import {
   type Peer,
 } from "./room-manager.js";
 import { decideMode } from "./recording-util.js";
+import { kickThreshold } from "./kick-util.js";
 import { RateLimiter, CHAT_HISTORY_MAX, CHAT_TEXT_MAX, type ChatMessage } from "./chat-util.js";
 import { notifyPublicRoomCreated, notifyPublicRoomJoin } from "./notify.js";
 import type { RecordingManager, ProducerInfo } from "./recording.js";
@@ -82,6 +83,9 @@ const joinSchema = z.object({
   // server re-pins SFU for the rejoin (the share producer is rebuilt right
   // after, in setupSfu). On a first join it's always false.
   sharing: z.boolean().optional(),
+  // Same as `sharing`, but for an in-progress local-file stream: re-pins SFU on
+  // a reconnect so the "file" producer rebuilds. Always false on a first join.
+  fileStreaming: z.boolean().optional(),
   // Per-session, per-room random token the client persists (sessionStorage).
   // Identifies an already-admitted session so a reconnect/refresh skips the
   // knock gate, and is what an approval records as "admitted".
@@ -141,6 +145,12 @@ export function createSignalingServer(
   // client keeps the unsent text and plays a "thunk"), never queued.
   const chatLimiter = new RateLimiter();
 
+  // Anti-spam for vote-to-kick: at most 5 vote *changes* / 10s per voter, so a
+  // peer can't flood the room with "X voted to kick Y / withdrew…" churn.
+  // Keyed by socket id; only real cast/withdraw toggles consume a slot (a
+  // redundant re-vote or empty withdraw is a no-op and doesn't count).
+  const kickLimiter = new RateLimiter();
+
   // Append a message to the room's bounded history and fan it out to everyone
   // in the room — INCLUDING the original sender, so the sender's own client
   // also gets the echo to render, announce, and chime on.
@@ -194,6 +204,7 @@ export function createSignalingServer(
       streamManager.isStreaming(room.name) ||
       room.casters.size > 0 ||
       room.sharers.size > 0 ||
+      room.fileStreamers.size > 0 ||
       room.disableP2p
     );
   }
@@ -260,6 +271,136 @@ export function createSignalingServer(
     });
   }
 
+  // --- Vote-to-kick (public rooms only; no moderators) ---
+
+  // How many peers count toward the kick threshold: everyone EXCEPT casters
+  // (send-only infra like Ecobox, which never votes and can't be kicked). The
+  // target is included, matching kickThreshold's `n`.
+  function votablePeerCount(room: Room): number {
+    let n = 0;
+    for (const id of room.peers.keys()) if (!room.casters.has(id)) n++;
+    return n;
+  }
+
+  // Drop a departing peer from the kick tallies: their own pending removal vote
+  // tally is moot, and any votes THEY cast against others are retracted. Each
+  // affected target gets a `recount` so everyone's "(N votes)" label updates
+  // (silent — no "withdrew" announcement, since this is a leave, not a choice).
+  function cleanupKickVotes(room: Room, departedId: string) {
+    room.kickVotes.delete(departedId);
+    for (const [targetId, voters] of room.kickVotes) {
+      if (!voters.delete(departedId)) continue;
+      if (voters.size === 0) room.kickVotes.delete(targetId);
+      io.to(room.name).emit("kick-vote", {
+        targetId,
+        targetName: room.peers.get(targetId)?.displayName ?? "",
+        votes: voters.size,
+        voterId: null,
+        voterName: null,
+        action: "recount",
+      });
+    }
+  }
+
+  // Remove one peer from the room and clean up everything they held — the shared
+  // teardown for BOTH a normal disconnect and a vote-kick. `announceLeft` is
+  // false for a kick (peers already got `peer-kicked` instead of `peer-left`).
+  // No-ops if the peer is already gone, so a kicked socket's own later disconnect
+  // doesn't double-fire.
+  function teardownPeer(room: Room, peerId: string, opts: { announceLeft: boolean }) {
+    const peer = room.peers.get(peerId);
+    if (!peer) return;
+
+    if (opts.announceLeft) {
+      io.to(room.name).except(peerId).emit("peer-left", { peerId });
+    }
+
+    // Stop capturing/feeding this peer's producers (already-recorded audio stays
+    // on disk and is still included in downloads).
+    if (recordingManager.isRecording(room.name)) {
+      for (const producerId of peer.producers.keys()) {
+        void recordingManager.removeProducer(room.name, producerId).catch(() => {});
+      }
+    }
+    if (streamManager.isStreaming(room.name)) {
+      for (const producerId of peer.producers.keys()) {
+        void streamManager.removeProducer(room.name, producerId).catch(() => {});
+      }
+    }
+    // If this was the last peer, the room is about to be destroyed — drop any
+    // recording (active or finished-but-downloadable) and tear down any stream.
+    if (room.peers.size <= 1 && recordingManager.getRecording(room.name)) {
+      void recordingManager.discard(room.name).catch(() => {});
+    }
+    if (room.peers.size <= 1 && streamManager.isStreaming(room.name)) {
+      void streamManager.stop(room.name).catch(() => {});
+    }
+
+    // Drop from the caster/sharer/file-streamer sets before removePeer (which
+    // may destroy the room) so the mode decision no longer forces SFU once this
+    // music caster / audio-sharer / file-streamer is gone.
+    room.casters.delete(peerId);
+    room.sharers.delete(peerId);
+    room.fileStreamers.delete(peerId);
+    cleanupKickVotes(room, peerId);
+
+    removePeer(room, peerId);
+
+    if (room.peers.size > 0) {
+      applyModeDecision(room);
+    } else if (room.pendingJoins.size > 0) {
+      // The room just emptied while someone was still knocking — their request
+      // can never be answered now, so let them go (their client surfaces the
+      // denial and can retry, landing in the now-empty room).
+      for (const reqId of room.pendingJoins.keys()) io.to(reqId).emit("join-denied", {});
+      room.pendingJoins.clear();
+    }
+  }
+
+  // Remove a peer the room voted out. Tells the room (`peer-kicked`) and the
+  // target (`you-were-kicked`), room-bans their IP so they can't immediately
+  // walk back in (the same soft ban a knock-deny applies), tears them down, then
+  // force-disconnects their socket. Emitting before disconnecting flushes the
+  // notice to them first; a server-initiated disconnect won't auto-reconnect.
+  function kickPeer(room: Room, targetId: string) {
+    const target = room.peers.get(targetId);
+    if (!target) {
+      room.kickVotes.delete(targetId);
+      return;
+    }
+    if (target.ip) room.bannedIps.add(target.ip);
+    room.admittedNames.delete(target.displayName);
+
+    io.to(room.name).except(targetId).emit("peer-kicked", {
+      peerId: targetId,
+      displayName: target.displayName,
+    });
+    io.to(targetId).emit("you-were-kicked", {});
+    console.log(`[ws] ${target.displayName} (${targetId}) kicked from ${room.name} by vote`);
+
+    teardownPeer(room, targetId, { announceLeft: false });
+    io.sockets.sockets.get(targetId)?.disconnect(true);
+  }
+
+  // Remove every target that has reached the current threshold. A kick shrinks
+  // the room, which lowers the threshold and can push the next target over the
+  // line, so loop until nobody qualifies (bounded by the peer count). Called
+  // after any vote change or membership change.
+  function settleKicks(room: Room) {
+    for (let guard = room.peers.size + 1; guard >= 0; guard--) {
+      const threshold = kickThreshold(votablePeerCount(room));
+      let kicked = false;
+      for (const [targetId, voters] of room.kickVotes) {
+        if (voters.size >= threshold && room.peers.has(targetId)) {
+          kickPeer(room, targetId); // mutates kickVotes — restart the scan
+          kicked = true;
+          break;
+        }
+      }
+      if (!kicked) break;
+    }
+  }
+
   io.on("connection", (socket) => {
     console.log(`[ws] connected: ${socket.id}`);
     let currentRoom: Room | null = null;
@@ -272,8 +413,16 @@ export function createSignalingServer(
 
     socket.on("join", async (data: unknown, cb: (res: unknown) => void) => {
       try {
-        const { roomName, displayName, role, disableP2p, isPublic, sharing, joinToken } =
-          joinSchema.parse(data);
+        const {
+          roomName,
+          displayName,
+          role,
+          disableP2p,
+          isPublic,
+          sharing,
+          fileStreaming,
+          joinToken,
+        } = joinSchema.parse(data);
         const room = await getOrCreateRoom(roomName);
         const ip = clientIp(socket);
 
@@ -292,10 +441,15 @@ export function createSignalingServer(
         const wasPublic = room.isPublic;
 
         // Knock-to-join: a newcomer to an ALREADY-public, occupied room must be
-        // let in by someone inside. Casters (infra, e.g. Ecobox) and returning
-        // sessions (reconnect/refresh, recognized by their join token) skip the
-        // gate; a private room reached by name still joins openly.
-        const alreadyAdmitted = joinToken != null && room.admittedTokens.has(joinToken);
+        // let in by someone inside. Skipping the gate: casters (infra, e.g.
+        // Ecobox); returning sessions recognized by their join token
+        // (reconnect/refresh); and anyone whose display name was already
+        // admitted to this room and not since denied (someone let in earlier who
+        // left and came back under the same name). A PRIVATE room never gates —
+        // `wasPublic` is false, so anyone with the link joins openly.
+        const alreadyAdmitted =
+          (joinToken != null && room.admittedTokens.has(joinToken)) ||
+          room.admittedNames.has(displayName);
         if (wasPublic && room.peers.size > 0 && role !== "caster" && !alreadyAdmitted) {
           room.pendingJoins.set(socket.id, { displayName, token: joinToken ?? "", ip });
           pendingRequest = room;
@@ -313,12 +467,14 @@ export function createSignalingServer(
         );
 
         // Admitted (open join, reconnect, or just-approved): remember the token
-        // so a later reconnect/refresh skips the gate, and clear any knock state.
+        // AND the display name so a later reconnect/refresh — or a return under
+        // the same name after leaving — skips the gate; clear any knock state.
         if (joinToken != null) room.admittedTokens.add(joinToken);
+        room.admittedNames.add(displayName);
         pendingRequest = null;
 
         wireDucking(room);
-        const peer = createPeer(room, socket.id, displayName);
+        const peer = createPeer(room, socket.id, displayName, ip);
 
         // Register a caster / P2P-disable BEFORE deciding the mode, so the join
         // response (and the new peer's own setup) already reflects the
@@ -330,6 +486,8 @@ export function createSignalingServer(
         // A peer reconnecting mid-share re-pins SFU before the mode is decided,
         // so the rejoin lands straight in SFU and its share producer rebuilds.
         if (sharing) room.sharers.add(socket.id);
+        // Likewise for an in-progress local-file stream.
+        if (fileStreaming) room.fileStreamers.add(socket.id);
 
         currentRoom = room;
         currentPeer = peer;
@@ -346,8 +504,15 @@ export function createSignalingServer(
         // (target + on/off live in .env, hidden from users). Fire-and-forget:
         // either the room was just made public (born) or it already was.
         if (room.isPublic) {
-          if (!wasPublic) notifyPublicRoomCreated(roomName, displayName);
-          else notifyPublicRoomJoin(roomName, displayName, room.peers.size);
+          if (!wasPublic) {
+            notifyPublicRoomCreated(roomName, displayName);
+            // This join just flipped an existing room public — tell anyone
+            // already inside so their vote-to-kick controls appear (the joiner
+            // itself learns it's public from `isPublic` in the join response).
+            socket.to(roomName).emit("room-public", {});
+          } else {
+            notifyPublicRoomJoin(roomName, displayName, room.peers.size);
+          }
         }
 
         // A newcomer who lands while others are still knocking sees them too,
@@ -387,6 +552,15 @@ export function createSignalingServer(
           rtpCapabilities: room.router.rtpCapabilities,
           peers: existingPeers,
           mode: decision.mode,
+          // Whether this room is publicly listed — gates the vote-to-kick UI
+          // (only public rooms can vote-kick; private rooms are link-gated).
+          isPublic: room.isPublic,
+          // Current vote-to-kick tallies so a (re)joiner renders existing votes
+          // (their own vote state always starts clear — votes are per session).
+          kickVotes: Array.from(room.kickVotes.entries()).map(([targetId, voters]) => ({
+            targetId,
+            votes: voters.size,
+          })),
           recording: recordingManager.isRecording(room.name)
             ? { recordingId: recordingManager.getRecording(room.name)!.id }
             : null,
@@ -396,6 +570,8 @@ export function createSignalingServer(
           // Whether someone is talking RIGHT NOW, so a late joiner starts
           // music peers ducked instead of waiting for the next transition.
           voiceActive: room.voiceActive,
+          // Room-wide auto-ducking toggle, so a joiner matches the room's state.
+          duckingEnabled: room.duckingEnabled,
           // Recent chat so a late joiner can read/announce the last messages.
           messages: room.messages,
         });
@@ -518,8 +694,9 @@ export function createSignalingServer(
             kind: z.enum(["audio", "video"]) as z.ZodType<MediaKind>,
             rtpParameters: z.any() as z.ZodType<RtpParameters>,
             // "music" for a caster's stereo track, "share" for a peer's stereo
-            // system/tab-audio share, "voice" (default) for mics.
-            source: z.enum(["voice", "music", "share"]).optional(),
+            // system/tab-audio share, "file" for a peer streaming a local audio
+            // file, "voice" (default) for mics.
+            source: z.enum(["voice", "music", "share", "file"]).optional(),
           })
           .parse(data);
 
@@ -694,6 +871,67 @@ export function createSignalingServer(
       cb?.({ ok: true });
     });
 
+    // --- File streaming (a peer streaming a local audio file as a stereo
+    // producer). Independent of the audio share above and of any caster: a peer
+    // can stream a file AND share system audio at the same time. start-file-stream
+    // pins the room to SFU (a stereo producer must be routed by the server) and
+    // announces it; the client then produces a "file" track. ---
+    socket.on("start-file-stream", (_data: unknown, cb?: (res: unknown) => void) => {
+      if (!currentRoom || !currentPeer) return cb?.({ ok: false, error: "Not in a room" });
+      currentRoom.fileStreamers.add(socket.id);
+      socket.to(currentRoom.name).emit("file-stream-started", {
+        peerId: socket.id,
+        displayName: currentPeer.displayName,
+      });
+      applyModeDecision(currentRoom);
+      cb?.({ ok: true });
+    });
+
+    socket.on("stop-file-stream", (_data: unknown, cb?: (res: unknown) => void) => {
+      if (!currentRoom || !currentPeer) return cb?.({ ok: false, error: "Not in a room" });
+      currentRoom.fileStreamers.delete(socket.id);
+      // Close this peer's file producer(s) so consumers stop receiving the audio;
+      // the matching consumers close client-side via file-stream-stopped.
+      for (const [id, producer] of currentPeer.producers) {
+        if ((producer.appData?.source as string) === "file") {
+          producer.close();
+          currentPeer.producers.delete(id);
+          // Also stop its capture/feed if recording/streaming — otherwise the
+          // recorder/mixer idles on a dead port until it ends.
+          if (recordingManager.isRecording(currentRoom.name)) {
+            void recordingManager.removeProducer(currentRoom.name, id).catch(() => {});
+          }
+          if (streamManager.isStreaming(currentRoom.name)) {
+            void streamManager.removeProducer(currentRoom.name, id).catch(() => {});
+          }
+        }
+      }
+      socket.to(currentRoom.name).emit("file-stream-stopped", {
+        peerId: socket.id,
+        displayName: currentPeer.displayName,
+      });
+      // No longer pins SFU — fall back to P2P if <=2 peers and nothing else forces it.
+      applyModeDecision(currentRoom);
+      cb?.({ ok: true });
+    });
+
+    // --- Auto-ducking toggle (room-wide) ---
+    // Anyone can turn the room's auto-ducking on/off. Off means listeners stop
+    // ducking every music-type stream (caster/share/file). We just flip the room
+    // flag and broadcast it to EVERYONE (incl. the sender, like recording) — the
+    // gain change itself is applied client-side in effectiveGain.
+    socket.on("set-ducking", (data: unknown, cb?: (res: unknown) => void) => {
+      if (!currentRoom || !currentPeer) return cb?.({ ok: false, error: "Not in a room" });
+      const parsed = z.object({ enabled: z.boolean() }).safeParse(data);
+      if (!parsed.success) return cb?.({ ok: false, error: "Invalid value" });
+      currentRoom.duckingEnabled = parsed.data.enabled;
+      io.to(currentRoom.name).emit("ducking-changed", {
+        enabled: parsed.data.enabled,
+        by: currentPeer.displayName,
+      });
+      cb?.({ ok: true });
+    });
+
     // --- Recording ---
     socket.on("start-recording", async (_data: unknown, cb: (res: unknown) => void) => {
       try {
@@ -846,6 +1084,9 @@ export function createSignalingServer(
         // Ban the denied visitor's IP from THIS room (only) so they can't just
         // re-knock; the ban lives as long as the room does.
         if (pending.ip) room.bannedIps.add(pending.ip);
+        // Drop the name from the auto-admit set: a denial overrides any earlier
+        // admission, so this name must knock again rather than walk back in.
+        room.admittedNames.delete(pending.displayName);
         io.to(requestId).emit("join-denied", { by: currentPeer.displayName });
         console.log(
           `[ws] ${currentPeer.displayName} denied + banned ${requestId} (${pending.ip}) from ${room.name}`,
@@ -855,9 +1096,69 @@ export function createSignalingServer(
       cb?.({ ok: true });
     });
 
+    // --- Vote to kick (public rooms; no moderators) ---
+    // Cast or withdraw a vote to remove another peer. Real toggles broadcast a
+    // `kick-vote` to the whole room (so everyone updates the tally + announces);
+    // once a target reaches kickThreshold it's removed (settleKicks). Casters
+    // and yourself can't be targeted; private rooms — and two-person rooms (no
+    // real majority) — have no vote-kick at all.
+    socket.on("vote-kick", (data: unknown, cb?: (res: unknown) => void) => {
+      if (!currentRoom || !currentPeer) return cb?.({ ok: false, error: "Not in a room" });
+      const room = currentRoom;
+      if (!room.isPublic) return cb?.({ ok: false, error: "not_public" });
+      // Defense-in-depth — the client also hides the controls below 3 votable
+      // peers (kickThreshold is Infinity there, so a vote could never land).
+      if (votablePeerCount(room) < 3) return cb?.({ ok: false, error: "too_small" });
+
+      const parsed = z.object({ targetId: z.string(), vote: z.boolean() }).safeParse(data);
+      if (!parsed.success) return cb?.({ ok: false, error: "Invalid vote" });
+      const { targetId, vote } = parsed.data;
+
+      if (targetId === socket.id) return cb?.({ ok: false, error: "self" });
+      const target = room.peers.get(targetId);
+      if (!target || room.casters.has(targetId)) return cb?.({ ok: false, error: "no_target" });
+
+      const voters = room.kickVotes.get(targetId);
+      const alreadyVoted = voters?.has(socket.id) ?? false;
+      // Redundant re-vote / empty withdraw: a harmless no-op that neither
+      // broadcasts nor counts against the anti-spam budget.
+      if (vote === alreadyVoted) return cb?.({ ok: true });
+
+      // Only a real state change costs a rate-limit slot.
+      if (!kickLimiter.tryConsume(socket.id, Date.now())) {
+        return cb?.({ ok: false, error: "rate_limited" });
+      }
+
+      let next = voters;
+      if (vote) {
+        if (!next) {
+          next = new Set();
+          room.kickVotes.set(targetId, next);
+        }
+        next.add(socket.id);
+      } else {
+        next!.delete(socket.id);
+        if (next!.size === 0) room.kickVotes.delete(targetId);
+      }
+
+      io.to(room.name).emit("kick-vote", {
+        targetId,
+        targetName: target.displayName,
+        votes: next ? next.size : 0,
+        voterId: socket.id,
+        voterName: currentPeer.displayName,
+        action: vote ? "cast" : "withdraw",
+      });
+
+      // A fresh vote may have reached the threshold (or a withdraw left it below).
+      settleKicks(room);
+      cb?.({ ok: true });
+    });
+
     socket.on("disconnect", (reason) => {
       console.log(`[ws] disconnected: ${socket.id} (${reason})`);
       chatLimiter.forget(socket.id);
+      kickLimiter.forget(socket.id);
 
       // A visitor who was still knocking (never admitted) bailed — retract their
       // request so participants' modals update.
@@ -869,48 +1170,12 @@ export function createSignalingServer(
 
       if (currentRoom && currentPeer) {
         const room = currentRoom;
-        socket.to(room.name).emit("peer-left", { peerId: socket.id });
-
-        // Stop capturing/feeding this peer's producers (the already-recorded
-        // audio stays on disk and is still included in downloads).
-        if (recordingManager.isRecording(room.name)) {
-          for (const producerId of currentPeer.producers.keys()) {
-            void recordingManager.removeProducer(room.name, producerId).catch(() => {});
-          }
-        }
-        if (streamManager.isStreaming(room.name)) {
-          for (const producerId of currentPeer.producers.keys()) {
-            void streamManager.removeProducer(room.name, producerId).catch(() => {});
-          }
-        }
-        // If this was the last peer, the room is about to be destroyed — drop
-        // any recording (active or finished-but-downloadable) and its files,
-        // and tear down any live stream.
-        if (room.peers.size <= 1 && recordingManager.getRecording(room.name)) {
-          void recordingManager.discard(room.name).catch(() => {});
-        }
-        if (room.peers.size <= 1 && streamManager.isStreaming(room.name)) {
-          void streamManager.stop(room.name).catch(() => {});
-        }
-
-        // Drop this peer from the caster/sharer sets before removePeer (which
-        // may destroy the room) so the mode decision below no longer forces SFU
-        // once the music caster — or audio-sharer — is gone.
-        room.casters.delete(socket.id);
-        room.sharers.delete(socket.id);
-
-        removePeer(room, socket.id);
-
-        // Check if we should switch modes (won't downgrade while recording).
-        if (room.peers.size > 0) {
-          applyModeDecision(room);
-        } else if (room.pendingJoins.size > 0) {
-          // The room just emptied while someone was still knocking — their
-          // request can never be answered now, so let them go (their client
-          // surfaces the denial and can retry, landing in the now-empty room).
-          for (const reqId of room.pendingJoins.keys()) io.to(reqId).emit("join-denied", {});
-          room.pendingJoins.clear();
-        }
+        // Shared teardown (also re-evaluates the mode). No-ops if this peer was
+        // already removed by a vote-kick that force-disconnected them.
+        teardownPeer(room, socket.id, { announceLeft: true });
+        // A departure shrinks the room, lowering the kick threshold — that can
+        // push an already-half-voted target over the line, so re-settle.
+        settleKicks(room);
       }
     });
   });

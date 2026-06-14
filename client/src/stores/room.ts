@@ -87,6 +87,11 @@ export interface PeerState {
   // True for a send-only "music caster" peer (e.g. Ecobox): rendered with a
   // music icon and treated as a media source rather than a talking participant.
   isMusic: boolean;
+  // Vote-to-kick (public rooms): how many people have voted to remove this peer
+  // (server-authoritative tally), and whether WE are one of them (drives the
+  // kick button's aria-pressed). Both 0/false outside a public room.
+  kickVotes: number;
+  iVotedKick: boolean;
 }
 
 export type RoomMode = "p2p" | "sfu";
@@ -116,7 +121,16 @@ interface RoomState {
   isDeafened: boolean;
   isPushToTalk: boolean;
   pttActive: boolean;
+  // Room-wide auto-ducking toggle (default on). When off, no music-type stream
+  // (caster/share/file) is ducked under voice. Synced from the server.
+  duckingEnabled: boolean;
   isSharingAudio: boolean;
+  // Local-file streaming (independent of the audio share): the name of the file
+  // currently being streamed into the call (null = not streaming), and whether
+  // it's playing or paused. Drives the floating file-player window and the
+  // toolbar button. The actual <audio> element lives in the media hook.
+  fileStreamName: string | null;
+  fileStreamPlaying: boolean;
   // Outgoing (send-side) mic gain applied before the track reaches peers/SFU,
   // 0–MAX_MIC_GAIN. 1 = unity (raw mic). Lets a quiet/cheap mic be boosted for
   // everyone, independent of each listener's per-peer playback volume.
@@ -154,6 +168,14 @@ interface RoomState {
   joinRequests: JoinRequest[];
   awaitingApproval: boolean;
 
+  // Whether the current room is publicly listed. Gates the vote-to-kick UI
+  // (only public rooms can vote-kick). Seeded from the join response and flipped
+  // by a `room-public` event if someone makes the room public after we joined.
+  roomIsPublic: boolean;
+  // Set true when WE were voted out of the room. Room.tsx shows a dedicated
+  // "you were removed" screen; cleared on reset (leaving / next join).
+  kicked: boolean;
+
   // Peers
   peers: Map<string, PeerState>;
 
@@ -170,7 +192,10 @@ interface RoomState {
   setDeafened: (deafened: boolean) => void;
   setPttActive: (active: boolean) => void;
   togglePushToTalk: () => void;
+  setDuckingEnabled: (enabled: boolean) => void;
   setSharingAudio: (sharing: boolean) => void;
+  setFileStream: (name: string | null) => void;
+  setFileStreamPlaying: (playing: boolean) => void;
   setMicGain: (gain: number) => void;
   setMicDeviceId: (deviceId: string) => void;
   setSpeakerDeviceId: (deviceId: string) => void;
@@ -182,6 +207,8 @@ interface RoomState {
   announceEvent: (message: string) => void;
   setJoinRequests: (requests: JoinRequest[]) => void;
   setAwaitingApproval: (awaiting: boolean) => void;
+  setRoomIsPublic: (isPublic: boolean) => void;
+  setKicked: (kicked: boolean) => void;
   addMessage: (message: ChatMessage) => void;
   addPeer: (peerId: string, displayName: string) => void;
   removePeer: (peerId: string) => void;
@@ -189,6 +216,9 @@ interface RoomState {
   setPeerMuted: (peerId: string, muted: boolean) => void;
   setPeerVolume: (peerId: string, volume: number) => void;
   setPeerMusic: (peerId: string, isMusic: boolean) => void;
+  // Update a peer's vote-to-kick tally; `iVoted` is set only when WE toggled
+  // (left undefined for others' votes / membership recounts, keeping our state).
+  setPeerKickVote: (peerId: string, votes: number, iVoted?: boolean) => void;
   reset: () => void;
 }
 
@@ -203,7 +233,10 @@ export const useRoomStore = create<RoomState>((set) => ({
   isDeafened: false,
   isPushToTalk: false,
   pttActive: false,
+  duckingEnabled: true,
   isSharingAudio: false,
+  fileStreamName: null,
+  fileStreamPlaying: false,
   micGain: loadMicGain(),
   micDeviceId: loadString(MIC_DEVICE_KEY),
   speakerDeviceId: loadString(SPEAKER_DEVICE_KEY),
@@ -216,6 +249,8 @@ export const useRoomStore = create<RoomState>((set) => ({
   announceSeq: 0,
   joinRequests: [],
   awaitingApproval: false,
+  roomIsPublic: false,
+  kicked: false,
   peers: new Map(),
   messages: [],
 
@@ -233,7 +268,10 @@ export const useRoomStore = create<RoomState>((set) => ({
   setDeafened: (isDeafened) => set({ isDeafened }),
   setPttActive: (pttActive) => set({ pttActive }),
   togglePushToTalk: () => set((s) => ({ isPushToTalk: !s.isPushToTalk })),
+  setDuckingEnabled: (duckingEnabled) => set({ duckingEnabled }),
   setSharingAudio: (isSharingAudio) => set({ isSharingAudio }),
+  setFileStream: (fileStreamName) => set({ fileStreamName }),
+  setFileStreamPlaying: (fileStreamPlaying) => set({ fileStreamPlaying }),
   setMicGain: (micGain) => {
     try {
       localStorage.setItem(MIC_GAIN_KEY, String(micGain));
@@ -268,6 +306,8 @@ export const useRoomStore = create<RoomState>((set) => ({
   announce: (message) => set((s) => ({ announcement: message, announceSeq: s.announceSeq + 1 })),
   setJoinRequests: (joinRequests) => set({ joinRequests }),
   setAwaitingApproval: (awaitingApproval) => set({ awaitingApproval }),
+  setRoomIsPublic: (roomIsPublic) => set({ roomIsPublic }),
+  setKicked: (kicked) => set({ kicked }),
 
   // Room-event announcement (recording/share/music/mute…): speak it AND log it
   // into the chat history as a "system" entry, so chat is the single timeline
@@ -313,6 +353,8 @@ export const useRoomStore = create<RoomState>((set) => ({
         isMuted: false,
         volume: 1,
         isMusic: false,
+        kickVotes: 0,
+        iVotedKick: false,
       });
       return { peers };
     }),
@@ -356,6 +398,19 @@ export const useRoomStore = create<RoomState>((set) => ({
       return { peers };
     }),
 
+  setPeerKickVote: (peerId, votes, iVoted) =>
+    set((state) => {
+      const peers = new Map(state.peers);
+      const peer = peers.get(peerId);
+      if (peer)
+        peers.set(peerId, {
+          ...peer,
+          kickVotes: votes,
+          iVotedKick: iVoted ?? peer.iVotedKick,
+        });
+      return { peers };
+    }),
+
   reset: () =>
     set({
       connected: false,
@@ -367,7 +422,10 @@ export const useRoomStore = create<RoomState>((set) => ({
       isDeafened: false,
       isPushToTalk: false,
       pttActive: false,
+      duckingEnabled: true,
       isSharingAudio: false,
+      fileStreamName: null,
+      fileStreamPlaying: false,
       isRecording: false,
       recordingId: null,
       // Keep streamConfig (a persisted preference); only the live state resets.
@@ -377,6 +435,8 @@ export const useRoomStore = create<RoomState>((set) => ({
       announceSeq: 0,
       joinRequests: [],
       awaitingApproval: false,
+      roomIsPublic: false,
+      kicked: false,
       peers: new Map(),
       messages: [],
     }),

@@ -52,6 +52,16 @@ export function relativeTime(ts: number, now: number = Date.now()): string {
   return rtf().format(Math.round(diffSec / 86400), "day");
 }
 
+// What "copy this message" puts on the clipboard: the message body only — no
+// "sender:" prefix, no trailing "sent …" time. Event rows copy their localized
+// line (join/leave/system text). Shared by the chat panel's Ctrl+C and the
+// Alt+number double-press copy, so both copy exactly the same thing.
+export function messageContent(msg: ChatMessage): string {
+  if (msg.kind === "join") return chat_joined({ name: msg.sender });
+  if (msg.kind === "leave") return chat_left({ name: msg.sender });
+  return msg.text;
+}
+
 // e.g. "Alice: see you in 5 sent 2 minutes ago" — used verbatim by the message
 // list and the screen-reader announcement, so both stay in lockstep. Presence
 // events read as "Alice joined 2 minutes ago".

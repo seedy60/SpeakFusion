@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { Mic, MicOff, Volume2, Music } from "lucide-react";
+import { Mic, MicOff, Volume2, Music, UserX } from "lucide-react";
 import type { PeerState } from "../stores/room";
 import { m } from "../paraglide/messages.js";
 
@@ -10,6 +10,11 @@ interface ParticipantCardProps {
   // Local card only: your outgoing mic gain (send-side), and its setter.
   micGain?: number;
   onMicGainChange?: (gain: number) => void;
+  // Vote-to-kick (public rooms): whether to show the kick button for this peer,
+  // and the toggle for our own vote. peer.kickVotes / peer.iVotedKick supply the
+  // tally + our pressed state.
+  canKick?: boolean;
+  onToggleKick?: () => void;
 }
 
 function getInitials(name: string): string {
@@ -27,6 +32,8 @@ export function ParticipantCard({
   onVolumeChange,
   micGain,
   onMicGainChange,
+  canKick,
+  onToggleKick,
 }: ParticipantCardProps) {
   const handleVolume = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -44,8 +51,16 @@ export function ParticipantCard({
 
   return (
     <div
-      className="flex flex-col items-center gap-3 rounded-xl border border-sonic-600 bg-sonic-800 p-4 transition-all hover:border-sonic-500"
+      className={`flex flex-col items-center gap-3 rounded-xl border bg-sonic-800 p-4 transition-all ${
+        canKick && peer.kickVotes > 0
+          ? "border-red-500/70 ring-1 ring-red-500/40"
+          : "border-sonic-600 hover:border-sonic-500"
+      }`}
       role="listitem"
+      // aria-selected marks a peer the room is currently voting to remove (has
+      // at least one kick vote against them); only meaningful where a kick is
+      // possible, so it's left off non-votable cards.
+      aria-selected={canKick ? peer.kickVotes > 0 : undefined}
       aria-label={`${peer.displayName}${isLocal ? ` (${m.card_you()})` : ""}${peer.isMuted ? `, ${m.card_muted_fragment()}` : ""}${peer.isSpeaking ? `, ${m.card_speaking_fragment()}` : ""}`}
     >
       {/* Avatar */}
@@ -97,6 +112,46 @@ export function ParticipantCard({
             aria-label={m.card_volume_for({ name: peer.displayName })}
           />
         </div>
+      )}
+
+      {/* Vote-to-kick (public rooms): a toggle for our own vote. aria-pressed
+          reflects whether we've voted; the accessible name carries the running
+          tally ("Kick {name} (2 votes)") so it's announced on press/refresh. */}
+      {canKick && (
+        <button
+          type="button"
+          onClick={onToggleKick}
+          aria-pressed={peer.iVotedKick}
+          aria-label={
+            peer.kickVotes > 0
+              ? m.card_kick_with_votes({
+                  name: peer.displayName,
+                  votes:
+                    peer.kickVotes === 1
+                      ? m.card_votes_one()
+                      : m.card_votes_many({ count: peer.kickVotes }),
+                })
+              : m.card_kick({ name: peer.displayName })
+          }
+          title={
+            peer.iVotedKick
+              ? m.card_kick_withdraw_title({ name: peer.displayName })
+              : m.card_kick_title({ name: peer.displayName })
+          }
+          className={`flex w-full items-center justify-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors ${
+            peer.iVotedKick
+              ? "bg-red-600 text-white hover:bg-red-500"
+              : "bg-sonic-700 text-sonic-300 hover:bg-red-600/80 hover:text-white"
+          }`}
+        >
+          <UserX className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <span>{m.card_kick_label()}</span>
+          {peer.kickVotes > 0 && (
+            <span aria-hidden="true" className="font-semibold">
+              ({peer.kickVotes})
+            </span>
+          )}
+        </button>
       )}
 
       {/* Mic-level slider (your own card): your outgoing gain — send-side, so it

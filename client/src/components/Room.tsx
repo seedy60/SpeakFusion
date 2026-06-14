@@ -3,9 +3,10 @@ import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { Headphones, Users, Loader2, Circle, MessageSquare, Radio } from "lucide-react";
 import { useRoomStore } from "../stores/room";
 import { useMediasoup } from "../hooks/useMediasoup";
-import { formatMessage } from "../lib/chat";
+import { formatMessage, messageContent } from "../lib/chat";
 import { ParticipantCard } from "./ParticipantCard";
 import { AudioControls } from "./AudioControls";
+import { FileStreamPlayer } from "./FileStreamPlayer";
 import { Chat } from "./Chat";
 import { JoinRequests } from "./JoinRequests";
 import { LanguageSelect } from "./LanguageSelect";
@@ -13,6 +14,10 @@ import { Footer, PoweredBy } from "./Footer";
 import { m } from "../paraglide/messages.js";
 
 type JoinState = "idle" | "joining" | "joined" | "error";
+
+// Max gap between two Alt+<same number> presses for the second to count as a
+// "copy that message" double-press rather than a fresh readback.
+const DOUBLE_PRESS_MS = 600;
 
 // `?p2p=off` (also accepts false/0/no/disable/disabled) pins the room to the
 // SFU even with two participants, instead of the usual P2P mesh.
@@ -57,7 +62,11 @@ export function Room() {
     join,
     leave,
     toggleMute,
+    toggleDucking,
     toggleAudioShare,
+    startFileStream,
+    stopFileStream,
+    toggleFilePlayback,
     toggleRecording,
     startStreaming,
     stopStreaming,
@@ -65,11 +74,15 @@ export function Room() {
     setMicGain,
     sendChatMessage,
     decideJoinRequest,
+    voteKick,
   } = useMediasoup();
 
   const [joinState, setJoinState] = useState<JoinState>("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const [chatOpen, setChatOpen] = useState(false);
+  // Bumped to (re)focus the chat composer even when the panel is already open —
+  // used to hand focus to the call after the knock-to-join modal closes.
+  const [chatFocusSignal, setChatFocusSignal] = useState(0);
   const joinedRef = useRef(false);
   const knownPeersRef = useRef<Set<string>>(new Set());
   // How many messages had arrived last time chat was open, to badge unread.
@@ -77,11 +90,44 @@ export function Room() {
   // The header chat toggle — focus returns here when the panel closes, so
   // keyboard/SR focus is never dropped onto <body>.
   const chatToggleRef = useRef<HTMLButtonElement>(null);
+  // The last Alt+number readback (which digit, and when), so a quick second
+  // press of the SAME number copies that message instead of just re-reading it.
+  const lastAltNumRef = useRef<{ digit: string; at: number } | null>(null);
 
   const closeChat = useCallback(() => {
     setChatOpen(false);
     chatToggleRef.current?.focus();
   }, []);
+
+  // When the knock-to-join modal closes (everyone decided), drop focus back into
+  // the call by opening chat and focusing its composer (bumping the signal also
+  // re-focuses it if the panel was already open behind the modal).
+  const onJoinRequestsCleared = useCallback(() => {
+    setChatOpen(true);
+    setChatFocusSignal((n) => n + 1);
+  }, []);
+
+  // Hidden picker for the "stream a file" feature. `f` (and the idle toolbar
+  // button) opens it; choosing a file starts — or, mid-stream, replaces — the
+  // stream. The floating FileStreamPlayer handles play/pause + stop after that.
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const pickFile = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+  const onFileChosen = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      // Reset so picking the SAME file again still fires `change`.
+      e.target.value = "";
+      if (file) void startFileStream(file);
+    },
+    [startFileStream],
+  );
+  // Toolbar button: stop an active stream, otherwise open the picker.
+  const toggleFileStream = useCallback(() => {
+    if (useRoomStore.getState().fileStreamName != null) void stopFileStream();
+    else pickFile();
+  }, [stopFileStream, pickFile]);
 
   const localPeerId = useRoomStore((s) => s.localPeerId);
   const displayName = useRoomStore((s) => s.displayName);
@@ -91,11 +137,17 @@ export function Room() {
   const mode = useRoomStore((s) => s.mode);
   const isRecording = useRoomStore((s) => s.isRecording);
   const isStreaming = useRoomStore((s) => s.isStreaming);
+  const fileStreamName = useRoomStore((s) => s.fileStreamName);
+  const fileStreamPlaying = useRoomStore((s) => s.fileStreamPlaying);
   const messages = useRoomStore((s) => s.messages);
   const announcement = useRoomStore((s) => s.announcement);
   const announceSeq = useRoomStore((s) => s.announceSeq);
   // True while we're knocking on a public room and waiting to be let in.
   const awaitingApproval = useRoomStore((s) => s.awaitingApproval);
+  // Whether the room is public (shows the vote-to-kick controls) and whether we
+  // ourselves were just voted out (shows the "removed" screen).
+  const roomIsPublic = useRoomStore((s) => s.roomIsPublic);
+  const kicked = useRoomStore((s) => s.kicked);
 
   // Reflect the room name in the document/tab title while in (or joining) the
   // room, restoring the default when we leave.
@@ -175,14 +227,21 @@ export function Room() {
     if (joinState !== "joined") return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // While the knock-to-join modal is up it owns the keyboard — don't let any
+      // room shortcut (mute, share, Alt+number readback, …) fire underneath it.
+      if (useRoomStore.getState().joinRequests.length > 0) return;
+
       // Alt+1..9 and Alt+0 read the last 10 messages aloud via the ARIA region:
-      // 1 = newest, 2 = next, … 0 = the 10th most recent. The listener is on
-      // window, so it works whether the chat panel is open or closed. Match the
-      // *physical* number key (e.code) rather than e.key so it fires regardless
-      // of layout — on AZERTY/macOS-Option/AltGr, Alt+1 yields a non-digit e.key
-      // (which is why it appeared to only work with the composer focused). Plain
-      // e.key digits stay as a fallback. Checked before the input guard below so
-      // it also works while typing in the composer.
+      // 1 = newest, 2 = next, … 0 = the 10th most recent. Pressing the SAME
+      // number again within DOUBLE_PRESS_MS copies that message to the clipboard
+      // (the same body the chat panel's Ctrl+C copies) — so it's grabbable
+      // without opening the panel. The listener is on window, so it works
+      // whether the chat panel is open or closed. Match the *physical* number
+      // key (e.code) rather than e.key so it fires regardless of layout — on
+      // AZERTY/macOS-Option/AltGr, Alt+1 yields a non-digit e.key (which is why
+      // it appeared to only work with the composer focused). Plain e.key digits
+      // stay as a fallback. Checked before the input guard below so it also
+      // works while typing in the composer.
       if (e.altKey && !e.ctrlKey && !e.metaKey) {
         const digit =
           /^(?:Digit|Numpad)([0-9])$/.exec(e.code)?.[1] ?? (/^[0-9]$/.test(e.key) ? e.key : null);
@@ -191,7 +250,18 @@ export function Room() {
           const n = digit === "0" ? 10 : Number(digit);
           const { messages: msgs, announce } = useRoomStore.getState();
           const msg = msgs[msgs.length - n];
-          announce(msg ? formatMessage(msg, Date.now()) : m.room_no_message({ n }));
+          const now = Date.now();
+          const prev = lastAltNumRef.current;
+          // Second quick press of the same digit on an existing message → copy.
+          if (msg && prev && prev.digit === digit && now - prev.at < DOUBLE_PRESS_MS) {
+            lastAltNumRef.current = null;
+            void navigator.clipboard
+              ?.writeText(messageContent(msg))
+              .then(() => announce(m.chat_copied()));
+            return;
+          }
+          lastAltNumRef.current = { digit, at: now };
+          announce(msg ? formatMessage(msg, now) : m.room_no_message({ n }));
           return;
         }
       }
@@ -204,6 +274,14 @@ export function Room() {
       } else if (e.key === "a" || e.key === "A") {
         e.preventDefault();
         toggleAudioShare();
+      } else if (e.key === "f" || e.key === "F") {
+        // Pick a file to stream (mid-stream, picking a new one replaces it).
+        e.preventDefault();
+        pickFile();
+      } else if (e.key === "d" || e.key === "D") {
+        // Toggle room-wide auto-ducking.
+        e.preventDefault();
+        toggleDucking();
       } else if (e.key === "r" || e.key === "R") {
         e.preventDefault();
         toggleRecording();
@@ -214,7 +292,7 @@ export function Room() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [joinState, toggleMute, toggleAudioShare, toggleRecording]);
+  }, [joinState, toggleMute, toggleAudioShare, pickFile, toggleDucking, toggleRecording]);
 
   const handleLeave = useCallback(() => {
     postToHost("readyToClose");
@@ -272,7 +350,36 @@ export function Room() {
     );
   }
 
+  // Voted out of the room: a dedicated screen (this happens after we'd already
+  // joined, so it's separate from the join error state above). The SR text was
+  // already announced via announceEvent when the kick arrived.
+  if (kicked) {
+    return (
+      <div className="flex min-h-dvh flex-col bg-sonic-900">
+        <div className="flex flex-1 items-center justify-center">
+          <div className="flex max-w-sm flex-col items-center gap-4 px-4 text-center">
+            <p className="text-lg text-muted" role="alert">
+              {m.room_kicked()}
+            </p>
+            <button
+              onClick={() => navigate("/")}
+              className="rounded-lg bg-sonic-accent px-4 py-2 text-sm text-white hover:bg-sonic-accent/90"
+            >
+              {m.room_back_to_lobby()}
+            </button>
+          </div>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
   const peerList = Array.from(peers.values());
+  // Vote-to-kick needs a real group — it's disabled (controls hidden, like a
+  // private room) below 3 votable people. Votable = humans only: everyone
+  // except music casters (isMusic), plus ourself (+1).
+  const votableCount = peerList.filter((p) => !p.isMusic).length + 1;
+  const kickEnabled = roomIsPublic && votableCount >= 3;
 
   return (
     <div className="flex min-h-dvh flex-col bg-sonic-900">
@@ -364,6 +471,8 @@ export function Room() {
                   isMuted,
                   volume: 1,
                   isMusic: false,
+                  kickVotes: 0,
+                  iVotedKick: false,
                 }}
                 isLocal
                 micGain={micGain}
@@ -371,19 +480,24 @@ export function Room() {
               />
             )}
 
-            {/* Remote peers */}
+            {/* Remote peers. In a public room, each non-music peer gets a
+                vote-to-kick toggle (no moderators — the room decides). */}
             {peerList.map((peer) => (
               <ParticipantCard
                 key={peer.peerId}
                 peer={peer}
                 isLocal={false}
                 onVolumeChange={(v) => setPeerVolume(peer.peerId, v)}
+                canKick={kickEnabled && !peer.isMusic}
+                onToggleKick={() => voteKick(peer.peerId, !peer.iVotedKick)}
               />
             ))}
           </div>
         </main>
 
-        {chatOpen && <Chat onSend={sendChatMessage} onClose={closeChat} />}
+        {chatOpen && (
+          <Chat onSend={sendChatMessage} onClose={closeChat} focusSignal={chatFocusSignal} />
+        )}
       </div>
 
       {/* Bottom controls + attribution. The "Powered by SonicRoom" link lives
@@ -393,6 +507,8 @@ export function Room() {
         <AudioControls
           onToggleMute={toggleMute}
           onToggleAudioShare={toggleAudioShare}
+          onToggleFileStream={toggleFileStream}
+          onToggleDucking={toggleDucking}
           onToggleRecording={toggleRecording}
           onStartStreaming={startStreaming}
           onStopStreaming={stopStreaming}
@@ -409,7 +525,29 @@ export function Room() {
 
       {/* Knock-to-join: allow/deny people asking to enter this public room.
           Self-hides when nobody is waiting. */}
-      <JoinRequests onDecide={decideJoinRequest} />
+      <JoinRequests onDecide={decideJoinRequest} onCleared={onJoinRequestsCleared} />
+
+      {/* Hidden picker for "stream a file" (opened by `f` / the toolbar button). */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="audio/*"
+        onChange={onFileChosen}
+        className="hidden"
+        aria-hidden="true"
+        tabIndex={-1}
+      />
+
+      {/* Floating player for the local-file stream — autofocuses play/pause when
+          a file is picked; Escape stops the stream and closes it. */}
+      {fileStreamName && (
+        <FileStreamPlayer
+          name={fileStreamName}
+          playing={fileStreamPlaying}
+          onTogglePlay={toggleFilePlayback}
+          onStop={() => stopFileStream()}
+        />
+      )}
     </div>
   );
 }

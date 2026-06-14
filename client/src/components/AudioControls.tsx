@@ -9,6 +9,8 @@ import {
   Square,
   Download,
   FileArchive,
+  FileMusic,
+  AudioLines,
   Radio,
   Settings,
 } from "lucide-react";
@@ -20,6 +22,11 @@ import { m } from "../paraglide/messages.js";
 interface AudioControlsProps {
   onToggleMute: () => void;
   onToggleAudioShare: () => void;
+  // Stream a local file: opens the file picker when idle, stops the stream when
+  // one is active (the floating player also offers play/pause + stop).
+  onToggleFileStream: () => void;
+  // Flip the room-wide auto-ducking toggle (music dips under voice, or not).
+  onToggleDucking: () => void;
   onToggleRecording: () => void;
   onStartStreaming: () => Promise<void>;
   onStopStreaming: () => Promise<void>;
@@ -29,6 +36,8 @@ interface AudioControlsProps {
 export function AudioControls({
   onToggleMute,
   onToggleAudioShare,
+  onToggleFileStream,
+  onToggleDucking,
   onToggleRecording,
   onStartStreaming,
   onStopStreaming,
@@ -36,6 +45,8 @@ export function AudioControls({
 }: AudioControlsProps) {
   const isMuted = useRoomStore((s) => s.isMuted);
   const isSharingAudio = useRoomStore((s) => s.isSharingAudio);
+  const isStreamingFile = useRoomStore((s) => s.fileStreamName != null);
+  const duckingEnabled = useRoomStore((s) => s.duckingEnabled);
   const isRecording = useRoomStore((s) => s.isRecording);
   const recordingId = useRoomStore((s) => s.recordingId);
   const isStreaming = useRoomStore((s) => s.isStreaming);
@@ -85,6 +96,8 @@ export function AudioControls({
   const orderedIds = [
     "mute",
     "share",
+    "file",
+    "duck",
     "record",
     ...(recordingId ? ["download", "download-tracks"] : []),
     "stream",
@@ -203,6 +216,39 @@ export function AudioControls({
           ) : (
             <ScreenShare className="h-5 w-5" />
           )}
+        </button>
+
+        <button
+          {...item("file")}
+          onClick={onToggleFileStream}
+          className={`flex h-11 w-11 items-center justify-center rounded-full transition-all ${
+            isStreamingFile
+              ? "bg-sonic-accent text-white hover:bg-sonic-accent/90"
+              : "bg-sonic-700 text-sonic-200 hover:bg-sonic-600"
+          }`}
+          aria-label={isStreamingFile ? m.controls_stop_file() : m.controls_stream_file()}
+          aria-pressed={isStreamingFile}
+          title={isStreamingFile ? m.controls_stop_file_title() : m.controls_stream_file_title()}
+        >
+          <FileMusic className="h-5 w-5" />
+        </button>
+
+        {/* Auto-ducking toggle (room-wide). Default on shows as a normal control;
+            turning it OFF tints it amber to flag that music no longer dips under
+            voice for anyone in the room. */}
+        <button
+          {...item("duck")}
+          onClick={onToggleDucking}
+          className={`flex h-11 w-11 items-center justify-center rounded-full transition-all ${
+            duckingEnabled
+              ? "bg-sonic-700 text-sonic-200 hover:bg-sonic-600"
+              : "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30"
+          }`}
+          aria-label={duckingEnabled ? m.controls_ducking_disable() : m.controls_ducking_enable()}
+          aria-pressed={duckingEnabled}
+          title={duckingEnabled ? m.controls_ducking_on_title() : m.controls_ducking_off_title()}
+        >
+          <AudioLines className="h-5 w-5" />
         </button>
 
         <button

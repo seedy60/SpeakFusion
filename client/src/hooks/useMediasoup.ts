@@ -29,6 +29,22 @@ import {
   announce_share_stopped,
   announce_share_started_you,
   announce_share_stopped_you,
+  announce_file_stream_started,
+  announce_file_stream_stopped,
+  announce_file_stream_started_you,
+  announce_file_stream_stopped_you,
+  announce_file_stream_ended,
+  announce_file_stream_error,
+  announce_file_stream_paused,
+  announce_file_stream_resumed,
+  announce_ducking_enabled,
+  announce_ducking_disabled,
+  announce_kick_vote,
+  announce_kick_vote_withdrawn,
+  announce_peer_kicked,
+  announce_you_were_kicked,
+  file_stream_name,
+  file_player_streaming,
   share_stream_name,
 } from "../paraglide/messages.js";
 import { useRoomStore, type RoomMode, type JoinRequest } from "../stores/room";
@@ -121,6 +137,14 @@ const DUCK_FACTOR = 0.22;
 const DUCK_ATTACK = 0.05;
 const DUCK_RELEASE = 0.09;
 const GAIN_RAMP = 0.03;
+
+// Rapid mute/duck toggling would otherwise announce + chime on every single
+// flip — mute 10× and everyone hears/reads it 10×. Coalesce a burst: surface the
+// FIRST change immediately (leading edge, so a deliberate single toggle still
+// gives instant feedback), suppress the middle, then surface the final settled
+// state once more after TOGGLE_DEDUP_MS of quiet — and only if it actually
+// differs from what was last surfaced. So a mash shows at most the first + last.
+const TOGGLE_DEDUP_MS = 1000;
 
 // Soft limiter sitting after the outgoing mic gain so boosting a quiet/cheap
 // mic doesn't clip: transparent until peaks approach 0 dBFS, then ~20:1 with a
@@ -223,6 +247,12 @@ export function useMediasoup() {
     // Shared system/tab audio gets its OWN destination so it's produced as a
     // separate stereo "share" track — the voice track (outDest) stays mono.
     shareDest: MediaStreamAudioDestinationNode | null;
+    // A streamed local file gets its OWN destination too, so it's produced as a
+    // separate stereo "file" track, independent of voice AND of any share. The
+    // <audio> element feeding it is swapped (replace file) without touching this
+    // destination or its producer.
+    fileSource: MediaElementAudioSourceNode | null;
+    fileDest: MediaStreamAudioDestinationNode | null;
     micStream: MediaStream | null;
   } | null>(null);
   // Audio share (system / tab audio produced as its own stereo "share" track)
@@ -232,6 +262,18 @@ export function useMediasoup() {
   // Other peers' incoming share streams: producerId -> owner peerId, so we can
   // tear down a share "music" tile when its owner stops sharing or leaves.
   const shareOwnersRef = useRef<Map<string, string>>(new Map());
+  // Local file streaming (independent of the audio share above): the stereo
+  // "file" producer (SFU), the <audio> element decoding the file, its object
+  // URL, the Web Audio source node, and an AbortController for the element's
+  // ended/error listeners (so swapping the file never fires a stale handler).
+  const fileProducerRef = useRef<Producer | null>(null);
+  const fileAudioRef = useRef<HTMLAudioElement | null>(null);
+  const fileUrlRef = useRef<string | null>(null);
+  const fileAbortRef = useRef<AbortController | null>(null);
+  // Other peers' incoming file streams: producerId -> owner peerId, mirroring
+  // shareOwnersRef so a peer can stream a file AND share system audio at once
+  // without the two tearing each other's tiles down.
+  const fileOwnersRef = useRef<Map<string, string>>(new Map());
   // Local anti-spam guard for instant "thunk" feedback (the server enforces the
   // same 5-per-10s budget authoritatively).
   const chatLimiterRef = useRef(new RateLimiter());
@@ -282,20 +324,23 @@ export function useMediasoup() {
   // is active). Voice peers are unaffected by ducking.
   const effectiveGain = useCallback(
     (peerId: string): number => {
-      const peer = store.getState().peers.get(peerId);
-      if (!peer || store.getState().isDeafened) return 0;
-      if (peer.isMusic && isVoiceActiveRef.current) return peer.volume * DUCK_FACTOR;
+      const state = store.getState();
+      const peer = state.peers.get(peerId);
+      if (!peer || state.isDeafened) return 0;
+      // Ducking is gated by the room-wide toggle: with it off, music-type
+      // streams (caster/share/file) never dip under voice.
+      if (peer.isMusic && isVoiceActiveRef.current && state.duckingEnabled)
+        return peer.volume * DUCK_FACTOR;
       return peer.volume;
     },
     [store],
   );
 
-  // Server told us whether anyone is talking — ramp every music peer's gain.
-  const applyDuck = useCallback(
-    (active: boolean) => {
-      isVoiceActiveRef.current = active;
+  // Ramp every music peer's gain to its current effective value (respecting
+  // deafen, per-peer volume, the live duck state, and the room ducking toggle).
+  const rampMusicGains = useCallback(
+    (ramp: number = GAIN_RAMP) => {
       const now = sharedAudioContext.currentTime;
-      const ramp = active ? DUCK_ATTACK : DUCK_RELEASE;
       for (const [peerId, pa] of peerAudiosRef.current) {
         if (!store.getState().peers.get(peerId)?.isMusic) continue;
         pa.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, ramp);
@@ -304,15 +349,71 @@ export function useMediasoup() {
     [store, effectiveGain],
   );
 
+  // Server told us whether anyone is talking — ramp every music peer's gain.
+  const applyDuck = useCallback(
+    (active: boolean) => {
+      isVoiceActiveRef.current = active;
+      rampMusicGains(active ? DUCK_ATTACK : DUCK_RELEASE);
+    },
+    [rampMusicGains],
+  );
+
+  // Per-key state for the toggle coalescer (see TOGGLE_DEDUP_MS): a debounce
+  // timer, the value we last surfaced, and the latest pending value + emitter.
+  const surfaceRef = useRef<
+    Map<
+      string,
+      {
+        timer: number | null;
+        lastEmitted: boolean | undefined;
+        latestValue: boolean;
+        latestEmit: () => void;
+      }
+    >
+  >(new Map());
+
+  // Coalesce a rapid run of boolean-state toggles (mute, ducking, …) into at
+  // most a leading + a trailing announcement. `emit` does the actual
+  // announce/chime for THIS change; it runs immediately on the first change of a
+  // burst, and again when the burst settles iff the final value differs from the
+  // last surfaced one. The underlying effect (mute/gain) is applied by the
+  // caller BEFORE this — only the user-facing surfacing is debounced.
+  const surfaceToggle = useCallback((key: string, value: boolean, emit: () => void) => {
+    const map = surfaceRef.current;
+    const s = map.get(key) ?? {
+      timer: null,
+      lastEmitted: undefined as boolean | undefined,
+      latestValue: value,
+      latestEmit: emit,
+    };
+    s.latestValue = value;
+    s.latestEmit = emit;
+    // Leading edge: nothing pending and this is a genuine change → surface now.
+    if (s.timer === null && value !== s.lastEmitted) {
+      s.lastEmitted = value;
+      emit();
+    }
+    if (s.timer !== null) clearTimeout(s.timer);
+    s.timer = window.setTimeout(() => {
+      s.timer = null;
+      if (s.latestValue !== s.lastEmitted) {
+        s.lastEmitted = s.latestValue;
+        s.latestEmit();
+      }
+    }, TOGGLE_DEDUP_MS);
+    map.set(key, s);
+  }, []);
+
   // --- Shared: clean up all peer audio ---
   const cleanupAllPeerAudio = useCallback(() => {
     for (const pa of peerAudiosRef.current.values()) {
       destroyAudioPipeline(pa);
     }
     peerAudiosRef.current.clear();
-    // Share streams are keyed in peerAudiosRef too; drop their owner mapping so
-    // a re-consume (mode switch / reconnect) rebuilds it cleanly.
+    // Share + file streams are keyed in peerAudiosRef too; drop their owner
+    // mappings so a re-consume (mode switch / reconnect) rebuilds them cleanly.
     shareOwnersRef.current.clear();
+    fileOwnersRef.current.clear();
   }, []);
 
   // --- Outgoing audio graph (mic gain + soft limiter, + optional shared audio) ---
@@ -342,6 +443,8 @@ export function useMediasoup() {
       outDest,
       displaySource: null,
       shareDest: null,
+      fileSource: null,
+      fileDest: null,
       micStream: null,
     };
     return outGraphRef.current;
@@ -524,6 +627,10 @@ export function useMediasoup() {
     producerRef.current = null;
     musicProducerRef.current?.close();
     musicProducerRef.current = null;
+    // The file producer is rebuilt by setupSfuInner if a file stream is still
+    // active; closing with stopTracks:false keeps fileDest's track alive.
+    fileProducerRef.current?.close();
+    fileProducerRef.current = null;
     sendTransportRef.current?.close();
     sendTransportRef.current = null;
     recvTransportRef.current?.close();
@@ -550,7 +657,7 @@ export function useMediasoup() {
 
       const res = await emit<ConsumeResult>("consume", {
         producerId,
-        rtpCapabilities: device.rtpCapabilities,
+        rtpCapabilities: device.recvRtpCapabilities,
       });
 
       const consumer = await recvTransport.consume({
@@ -579,6 +686,21 @@ export function useMediasoup() {
         store.getState().addPeer(producerId, share_stream_name({ name: ownerName }));
         store.getState().setPeerMusic(producerId, true);
         shareOwnersRef.current.set(producerId, peerId);
+        peerAudiosRef.current.set(producerId, { ...pipeline, consumer });
+        pipeline.gainNode.gain.value = effectiveGain(producerId);
+        return;
+      }
+
+      // A "file" is a peer streaming a local audio file as a SEPARATE stereo
+      // producer — same treatment as a share (its own music-stream tile keyed by
+      // producer id, ducks under voice), but tracked in its own owner map so a
+      // peer streaming a file AND sharing system audio keeps the two independent.
+      if (source === "file") {
+        const ownerName =
+          store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
+        store.getState().addPeer(producerId, file_stream_name({ name: ownerName }));
+        store.getState().setPeerMusic(producerId, true);
+        fileOwnersRef.current.set(producerId, peerId);
         peerAudiosRef.current.set(producerId, { ...pipeline, consumer });
         pipeline.gainNode.gain.value = effectiveGain(producerId);
         return;
@@ -627,12 +749,45 @@ export function useMediasoup() {
         opusMaxPlaybackRate: 48000,
         opusMaxAverageBitrate: 256000,
       },
-      codec: device.rtpCapabilities.codecs?.find((c) => c.mimeType.toLowerCase() === "audio/opus"),
+      codec: device.recvRtpCapabilities.codecs?.find(
+        (c) => c.mimeType.toLowerCase() === "audio/opus",
+      ),
       appData: { source: "share" },
       // shareDest is an app-owned, long-lived Web Audio track reused across the
       // session; mediasoup-client must NOT stop it when this producer closes
       // (default stopTracks:true would kill it, so a later re-produce sends a
       // dead track and no RTP flows).
+      stopTracks: false,
+    });
+  }, []);
+
+  // Produce the streamed local file as a SEPARATE stereo, hi-fi "file" track
+  // (mirrors produceShare — the 256 kbps ceiling lets it negotiate full
+  // quality). Independent of the share producer. SFU-only; idempotent.
+  const produceFile = useCallback(async () => {
+    const sendTransport = sendTransportRef.current;
+    const device = deviceRef.current;
+    const g = outGraphRef.current;
+    if (!sendTransport || !device || !g?.fileDest) return;
+    if (fileProducerRef.current && !fileProducerRef.current.closed) return;
+    const track = g.fileDest.stream.getAudioTracks()[0];
+    if (!track) return;
+    fileProducerRef.current = await sendTransport.produce({
+      track,
+      codecOptions: {
+        opusStereo: true,
+        opusDtx: false,
+        opusFec: true,
+        opusMaxPlaybackRate: 48000,
+        opusMaxAverageBitrate: 256000,
+      },
+      codec: device.recvRtpCapabilities.codecs?.find(
+        (c) => c.mimeType.toLowerCase() === "audio/opus",
+      ),
+      appData: { source: "file" },
+      // fileDest is an app-owned, long-lived Web Audio track reused across the
+      // session and rebuilt-on-reconnect produces; mediasoup-client must NOT
+      // stop it when this producer closes (see produceShare).
       stopTracks: false,
     });
   }, []);
@@ -646,6 +801,20 @@ export function useMediasoup() {
         peerAudiosRef.current.delete(producerId);
       }
       shareOwnersRef.current.delete(producerId);
+      store.getState().removePeer(producerId);
+    },
+    [store],
+  );
+
+  // Tear down an incoming peer's file "music stream" (they stopped, or left).
+  const removeFileStream = useCallback(
+    (producerId: string) => {
+      const pa = peerAudiosRef.current.get(producerId);
+      if (pa) {
+        destroyAudioPipeline(pa);
+        peerAudiosRef.current.delete(producerId);
+      }
+      fileOwnersRef.current.delete(producerId);
       store.getState().removePeer(producerId);
     },
     [store],
@@ -740,7 +909,7 @@ export function useMediasoup() {
           opusFec: true,
           opusMaxPlaybackRate: 48000,
         },
-        codec: device.rtpCapabilities.codecs?.find(
+        codec: device.recvRtpCapabilities.codecs?.find(
           (c) => c.mimeType.toLowerCase() === "audio/opus",
         ),
         // outDest is an app-owned, long-lived Web Audio track reused for the
@@ -754,6 +923,8 @@ export function useMediasoup() {
       // If we were already sharing audio (a mode switch into SFU, or a
       // reconnect mid-share), rebuild the separate stereo share producer too.
       if (store.getState().isSharingAudio) await produceShare();
+      // Likewise rebuild the file producer if a local file stream is active.
+      if (store.getState().fileStreamName) await produceFile();
 
       // Consume any producers announced while the transports were still being
       // built (their new-producer events arrived too early and were queued).
@@ -770,6 +941,7 @@ export function useMediasoup() {
       ensureLocalStream,
       ensureOutGraph,
       produceShare,
+      produceFile,
       consumeProducer,
       store,
     ],
@@ -844,6 +1016,10 @@ export function useMediasoup() {
           recording: { recordingId: string } | null;
           streaming?: boolean;
           voiceActive?: boolean;
+          duckingEnabled?: boolean;
+          // Whether this room is public (gates vote-to-kick) + current tallies.
+          isPublic?: boolean;
+          kickVotes?: Array<{ targetId: string; votes: number }>;
           messages: ChatMessage[];
         };
         const joinPayload = {
@@ -855,6 +1031,8 @@ export function useMediasoup() {
           joinToken,
           // On a reconnect mid-share, re-pin SFU so the share rebuilds.
           sharing: store.getState().isSharingAudio,
+          // Likewise re-pin SFU on a reconnect mid-file-stream.
+          fileStreaming: store.getState().fileStreamName != null,
         };
 
         let joinRes = await emit<JoinResponse>("join", joinPayload);
@@ -881,8 +1059,10 @@ export function useMediasoup() {
 
         // Seed the current duck state BEFORE consuming, so a music peer that's
         // being talked over starts ducked instead of blasting at full volume
-        // until the next talk-start/stop transition.
+        // until the next talk-start/stop transition. Likewise seed the room-wide
+        // ducking toggle so effectiveGain is correct as producers are consumed.
         isVoiceActiveRef.current = !!joinRes.voiceActive;
+        store.getState().setDuckingEnabled(joinRes.duckingEnabled ?? true);
 
         // Seed chat history (de-duped in the store, silent — no chime/announce).
         for (const m of joinRes.messages ?? []) store.getState().addMessage(m);
@@ -896,6 +1076,8 @@ export function useMediasoup() {
           );
         // Likewise the room-wide live-streaming state.
         store.getState().setStreaming(!!joinRes.streaming);
+        // Whether this room is public — gates the vote-to-kick controls.
+        store.getState().setRoomIsPublic(!!joinRes.isPublic);
 
         // Reconcile the peer list: drop anyone who left while we were
         // disconnected, add newcomers. addPeer resets per-peer state, so only
@@ -911,6 +1093,11 @@ export function useMediasoup() {
           // Server truth for mute state — a late joiner (or a reconnect that
           // missed the peer-muted events) renders existing mutes correctly.
           store.getState().setPeerMuted(peer.peerId, !!peer.muted);
+        }
+        // Seed existing vote-to-kick tallies. Our own vote state always starts
+        // clear on a (re)join — votes are keyed by socket id, which changes.
+        for (const { targetId, votes } of joinRes.kickVotes ?? []) {
+          store.getState().setPeerKickVote(targetId, votes, false);
         }
 
         // Producers queued before this ack (stale modeRef during a rejoin) are
@@ -992,6 +1179,11 @@ export function useMediasoup() {
       socket.on("join-denied", () => {
         admissionRef.current?.reject(new Error("join_denied"));
       });
+      // Someone made the room public after we joined — reveal the vote-to-kick
+      // controls (the room was private when we arrived).
+      socket.on("room-public", () => {
+        store.getState().setRoomIsPublic(true);
+      });
 
       // --- Socket event handlers (attached once; persist across reconnects) ---
       socket.on(
@@ -1028,10 +1220,13 @@ export function useMediasoup() {
           destroyAudioPipeline(peerAudio);
           peerAudiosRef.current.delete(peerId);
         }
-        // Drop any share "music stream" tiles this peer owned (they may have
-        // left mid-share, without a stop-share/share-stopped first).
+        // Drop any share / file "music stream" tiles this peer owned (they may
+        // have left mid-share/-stream, without a stop event first).
         for (const [producerId, owner] of shareOwnersRef.current) {
           if (owner === peerId) removeShareStream(producerId);
+        }
+        for (const [producerId, owner] of fileOwnersRef.current) {
+          if (owner === peerId) removeFileStream(producerId);
         }
         store.getState().removePeer(peerId);
         if (wasMusic) {
@@ -1050,6 +1245,84 @@ export function useMediasoup() {
           });
         }
         playCue(sharedAudioContext, "leave");
+      });
+
+      // --- Vote to kick (public rooms) ---
+      // A vote was cast/withdrawn (or recounted after someone left). Update the
+      // tally; reflect OUR own toggle in iVotedKick (so the button's aria-pressed
+      // is right); announce OTHERS' votes (ours is conveyed by the button state).
+      socket.on(
+        "kick-vote",
+        ({
+          targetId,
+          targetName,
+          votes,
+          voterId,
+          voterName,
+          action,
+        }: {
+          targetId: string;
+          targetName: string;
+          votes: number;
+          voterId: string | null;
+          voterName: string | null;
+          action: "cast" | "withdraw" | "recount";
+        }) => {
+          const myId = store.getState().localPeerId;
+          const mine = voterId != null && voterId === myId;
+          store.getState().setPeerKickVote(targetId, votes, mine ? action === "cast" : undefined);
+          if (action === "recount" || mine) return;
+          const voter = voterName || announce_a_participant();
+          const target =
+            targetName ||
+            store.getState().peers.get(targetId)?.displayName ||
+            announce_a_participant();
+          store
+            .getState()
+            .announce(
+              action === "cast"
+                ? announce_kick_vote({ voter, target })
+                : announce_kick_vote_withdrawn({ voter, target }),
+            );
+        },
+      );
+
+      // Another peer was voted out: tear down their media (like a leave) and log
+      // it to chat as an event (rule: room events go to chat via announceEvent).
+      socket.on(
+        "peer-kicked",
+        ({ peerId, displayName }: { peerId: string; displayName: string }) => {
+          const name = store.getState().peers.get(peerId)?.displayName ?? displayName;
+          const pc = p2pConnectionsRef.current.get(peerId);
+          if (pc) {
+            pc.close();
+            p2pConnectionsRef.current.delete(peerId);
+          }
+          pendingCandidatesRef.current.delete(peerId);
+          const peerAudio = peerAudiosRef.current.get(peerId);
+          if (peerAudio) {
+            destroyAudioPipeline(peerAudio);
+            peerAudiosRef.current.delete(peerId);
+          }
+          for (const [producerId, owner] of shareOwnersRef.current) {
+            if (owner === peerId) removeShareStream(producerId);
+          }
+          for (const [producerId, owner] of fileOwnersRef.current) {
+            if (owner === peerId) removeFileStream(producerId);
+          }
+          store.getState().removePeer(peerId);
+          store.getState().announceEvent(announce_peer_kicked({ name }));
+          playCue(sharedAudioContext, "leave");
+        },
+      );
+
+      // WE were voted out. Show the dedicated "removed" screen (Room.tsx) and
+      // stop the socket so it doesn't auto-reconnect into the now-banned room.
+      socket.on("you-were-kicked", () => {
+        store.getState().setKicked(true);
+        store.getState().announceEvent(announce_you_were_kicked());
+        playCue(sharedAudioContext, "leave");
+        socket.disconnect();
       });
 
       // --- Recording (room-wide; the server forces SFU while recording) ---
@@ -1243,6 +1516,26 @@ export function useMediasoup() {
         applyDuck(active);
       });
 
+      // Room-wide ducking toggle changed (by anyone). Reflect it, re-ramp every
+      // music stream to its new level (un-duck when turned off, re-duck when
+      // turned back on if a voice is active), and log it. De-duped so an echo of
+      // our own change — or one matching the value we already have — is a no-op.
+      socket.on("ducking-changed", ({ enabled, by }: { enabled: boolean; by?: string }) => {
+        if (store.getState().duckingEnabled === enabled) return;
+        store.getState().setDuckingEnabled(enabled);
+        rampMusicGains();
+        const name = by ?? announce_a_participant();
+        // Coalesced so mashing the ducking toggle doesn't spam the whole room's
+        // chat log (the gain change above still applies on every flip).
+        surfaceToggle("ducking", enabled, () => {
+          store
+            .getState()
+            .announceEvent(
+              enabled ? announce_ducking_enabled({ name }) : announce_ducking_disabled({ name }),
+            );
+        });
+      });
+
       // A peer started sharing system/tab audio — announce it + play a cue.
       // Their stereo "share" stream arrives separately via new-producer.
       socket.on(
@@ -1266,21 +1559,47 @@ export function useMediasoup() {
         },
       );
 
+      // A peer started streaming a local file — announce it + play a cue. Their
+      // stereo "file" stream arrives separately via new-producer.
+      socket.on("file-stream-started", ({ displayName: name }: { displayName: string }) => {
+        store.getState().announceEvent(announce_file_stream_started({ name }));
+        playCue(sharedAudioContext, "share-start");
+      });
+
+      // A peer stopped their file stream — tear down their file "music stream"
+      // tile(s), announce it, and play a cue.
+      socket.on(
+        "file-stream-stopped",
+        ({ peerId, displayName: name }: { peerId: string; displayName: string }) => {
+          for (const [producerId, owner] of fileOwnersRef.current) {
+            if (owner === peerId) removeFileStream(producerId);
+          }
+          store.getState().announceEvent(announce_file_stream_stopped({ name }));
+          playCue(sharedAudioContext, "share-stop");
+        },
+      );
+
       // A remote peer toggled their mic: reflect it, play a soft cue, and speak
       // it on the polite ARIA region. Unlike other room events this is NOT
       // logged to chat (announce, not announceEvent) — it'd be too noisy.
       socket.on("peer-muted", ({ peerId }: { peerId: string }) => {
         store.getState().setPeerMuted(peerId, true);
-        const name = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
-        store.getState().announce(announce_peer_muted({ name }));
-        playCue(sharedAudioContext, "peer-mute");
+        // Coalesced per peer so a peer mashing their mic only blips us once or
+        // twice, not on every flip (see surfaceToggle).
+        surfaceToggle(`peer:${peerId}`, true, () => {
+          const name = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
+          store.getState().announce(announce_peer_muted({ name }));
+          playCue(sharedAudioContext, "peer-mute");
+        });
       });
 
       socket.on("peer-unmuted", ({ peerId }: { peerId: string }) => {
         store.getState().setPeerMuted(peerId, false);
-        const name = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
-        store.getState().announce(announce_peer_unmuted({ name }));
-        playCue(sharedAudioContext, "peer-unmute");
+        surfaceToggle(`peer:${peerId}`, false, () => {
+          const name = store.getState().peers.get(peerId)?.displayName ?? announce_a_participant();
+          store.getState().announce(announce_peer_unmuted({ name }));
+          playCue(sharedAudioContext, "peer-unmute");
+        });
       });
 
       // Incoming chat (including the echo of our own messages): render it, chime
@@ -1311,7 +1630,10 @@ export function useMediasoup() {
       teardownP2p,
       teardownSfu,
       applyDuck,
+      rampMusicGains,
+      surfaceToggle,
       removeShareStream,
+      removeFileStream,
       runTransition,
       flushPendingCandidates,
       store,
@@ -1330,9 +1652,12 @@ export function useMediasoup() {
     }
     await emit("producer-pause", {}).catch(() => {});
     store.getState().setMuted(true);
-    store.getState().announceEvent(announce_mic_muted());
-    playCue(sharedAudioContext, "mute");
-  }, [emit, store]);
+    // Coalesced so mashing mute doesn't spam the chat log + cue (see surfaceToggle).
+    surfaceToggle("mic", true, () => {
+      store.getState().announceEvent(announce_mic_muted());
+      playCue(sharedAudioContext, "mute");
+    });
+  }, [emit, store, surfaceToggle]);
 
   const unmute = useCallback(async () => {
     const track = localStreamRef.current?.getAudioTracks()[0];
@@ -1343,9 +1668,11 @@ export function useMediasoup() {
     }
     await emit("producer-resume", {}).catch(() => {});
     store.getState().setMuted(false);
-    store.getState().announceEvent(announce_mic_unmuted());
-    playCue(sharedAudioContext, "unmute");
-  }, [emit, store]);
+    surfaceToggle("mic", false, () => {
+      store.getState().announceEvent(announce_mic_unmuted());
+      playCue(sharedAudioContext, "unmute");
+    });
+  }, [emit, store, surfaceToggle]);
 
   const toggleMute = useCallback(async () => {
     if (store.getState().isMuted) await unmute();
@@ -1361,6 +1688,12 @@ export function useMediasoup() {
       peerAudio.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, GAIN_RAMP);
     }
   }, [store, effectiveGain]);
+
+  // Flip the room-wide auto-ducking toggle. Fire-and-forget: the server echoes
+  // `ducking-changed` to everyone (us included), which is what applies it.
+  const toggleDucking = useCallback(async () => {
+    await emit("set-ducking", { enabled: !store.getState().duckingEnabled }).catch(() => {});
+  }, [emit, store]);
 
   const setPeerVolume = useCallback(
     (peerId: string, volume: number) => {
@@ -1481,6 +1814,139 @@ export function useMediasoup() {
     else await startAudioShare();
   }, [store, startAudioShare, stopAudioShare]);
 
+  // --- File streaming: stream a local audio file into the call as a SEPARATE
+  // stereo "file" producer. Independent of the audio share; the file is decoded
+  // by an <audio> element whose Web Audio source feeds its own destination
+  // (produced) and the local speakers (monitored). Like a share it forces SFU
+  // and is auto-tapped by recording/streaming server-side. ---
+  const stopFileStream = useCallback(
+    async (announcement?: string) => {
+      if (store.getState().fileStreamName == null) return;
+      // Drop the element's ended/error listeners first so teardown can't fire them.
+      fileAbortRef.current?.abort();
+      fileAbortRef.current = null;
+      if (fileProducerRef.current) {
+        if (!fileProducerRef.current.closed) fileProducerRef.current.close();
+        fileProducerRef.current = null;
+      }
+      const g = outGraphRef.current;
+      g?.fileSource?.disconnect();
+      g?.fileDest?.disconnect();
+      if (g) {
+        g.fileSource = null;
+        g.fileDest = null;
+      }
+      if (fileAudioRef.current) {
+        fileAudioRef.current.pause();
+        fileAudioRef.current.src = "";
+        fileAudioRef.current = null;
+      }
+      if (fileUrlRef.current) {
+        URL.revokeObjectURL(fileUrlRef.current);
+        fileUrlRef.current = null;
+      }
+      store.getState().setFileStream(null);
+      store.getState().setFileStreamPlaying(false);
+      // Tell the server: drop us from the file-streamer set (may release the SFU
+      // pin) and close the server-side producer so peers' tiles disappear.
+      await emit("stop-file-stream").catch(() => {});
+      store.getState().announceEvent(announcement ?? announce_file_stream_stopped_you());
+      playCue(sharedAudioContext, "share-stop");
+    },
+    [store, emit],
+  );
+
+  const startFileStream = useCallback(
+    async (file: File) => {
+      const g = ensureOutGraph();
+      resumeSharedContext();
+
+      const firstStart = store.getState().fileStreamName == null;
+
+      // Replace path: tear down the previous element/source but KEEP fileDest and
+      // its producer, so swapping the file causes no mode flap or peer tile churn
+      // (the produced track is fileDest's, which never changes — only its input).
+      fileAbortRef.current?.abort();
+      fileAbortRef.current = null;
+      g.fileSource?.disconnect();
+      g.fileSource = null;
+      if (fileAudioRef.current) {
+        fileAudioRef.current.pause();
+        fileAudioRef.current.src = "";
+        fileAudioRef.current = null;
+      }
+      if (fileUrlRef.current) {
+        URL.revokeObjectURL(fileUrlRef.current);
+        fileUrlRef.current = null;
+      }
+
+      // New <audio> element decoding the chosen file.
+      const url = URL.createObjectURL(file);
+      fileUrlRef.current = url;
+      const audioEl = new Audio();
+      audioEl.src = url;
+      (audioEl as unknown as Record<string, boolean>).playsInline = true;
+      fileAudioRef.current = audioEl;
+
+      const source = sharedAudioContext.createMediaElementSource(audioEl);
+      g.fileSource = source;
+      // Its OWN destination → produced as a separate stereo "file" track.
+      if (!g.fileDest) g.fileDest = sharedAudioContext.createMediaStreamDestination();
+      source.connect(g.fileDest);
+      // Also monitor it locally, so the streamer hears what they're playing.
+      source.connect(sharedAudioContext.destination);
+
+      // Stop the whole stream when the file ends or fails to decode.
+      const ac = new AbortController();
+      fileAbortRef.current = ac;
+      audioEl.addEventListener("ended", () => void stopFileStream(announce_file_stream_ended()), {
+        signal: ac.signal,
+      });
+      audioEl.addEventListener("error", () => void stopFileStream(announce_file_stream_error()), {
+        signal: ac.signal,
+      });
+
+      store.getState().setFileStream(file.name);
+      try {
+        await audioEl.play();
+        store.getState().setFileStreamPlaying(true);
+      } catch {
+        // Autoplay refused (rare — we're in a user gesture); land paused so the
+        // window's play button can start it.
+        store.getState().setFileStreamPlaying(false);
+      }
+
+      if (firstStart) {
+        // A stereo producer must be routed by the server, so pin the room to SFU.
+        // If already on the SFU, produce now; otherwise the switch-to-sfu rebuilds
+        // the SFU and setupSfu produces the file (it sees fileStreamName).
+        const wasSfu = modeRef.current === "sfu";
+        await emit("start-file-stream").catch(() => {});
+        if (wasSfu) await produceFile();
+        store.getState().announceEvent(announce_file_stream_started_you());
+        playCue(sharedAudioContext, "share-start");
+      } else {
+        // Replacing the file mid-stream — producer/SFU pin are unchanged.
+        store.getState().announce(file_player_streaming({ name: file.name }));
+      }
+    },
+    [store, ensureOutGraph, emit, produceFile, stopFileStream],
+  );
+
+  const toggleFilePlayback = useCallback(() => {
+    const el = fileAudioRef.current;
+    if (!el) return;
+    if (el.paused) {
+      void el.play().catch(() => {});
+      store.getState().setFileStreamPlaying(true);
+      store.getState().announce(announce_file_stream_resumed());
+    } else {
+      el.pause();
+      store.getState().setFileStreamPlaying(false);
+      store.getState().announce(announce_file_stream_paused());
+    }
+  }, [store]);
+
   // --- Recording ---
   // Recording is server-side: the server taps every participant's stream off
   // the SFU. Starting it forces the room out of P2P (the server can't see P2P
@@ -1588,6 +2054,18 @@ export function useMediasoup() {
 
   const leave = useCallback(() => {
     detachSharedAudio();
+    // Tear down any active file stream (stops the <audio>, revokes its URL).
+    fileAbortRef.current?.abort();
+    fileAbortRef.current = null;
+    if (fileAudioRef.current) {
+      fileAudioRef.current.pause();
+      fileAudioRef.current.src = "";
+      fileAudioRef.current = null;
+    }
+    if (fileUrlRef.current) {
+      URL.revokeObjectURL(fileUrlRef.current);
+      fileUrlRef.current = null;
+    }
     teardownP2p();
     teardownSfu();
     // Tear down the outgoing graph (nodes live in the shared context, so just
@@ -1599,10 +2077,19 @@ export function useMediasoup() {
       g.limiter.disconnect();
       g.displaySource?.disconnect();
       g.shareDest?.disconnect();
+      g.fileSource?.disconnect();
+      g.fileDest?.disconnect();
       outGraphRef.current = null;
     }
     musicProducerRef.current = null;
+    fileProducerRef.current = null;
     shareOwnersRef.current.clear();
+    fileOwnersRef.current.clear();
+    // Cancel any pending coalesced mute/duck announcements.
+    for (const s of surfaceRef.current.values()) {
+      if (s.timer !== null) clearTimeout(s.timer);
+    }
+    surfaceRef.current.clear();
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     localStreamRef.current = null;
     socketRef.current?.disconnect();
@@ -1622,6 +2109,19 @@ export function useMediasoup() {
         .setJoinRequests(store.getState().joinRequests.filter((r) => r.id !== requestId));
     },
     [store],
+  );
+
+  // Vote to remove a peer (public rooms only), or withdraw that vote. We don't
+  // update local state optimistically — the server echoes an authoritative
+  // `kick-vote` to the whole room (including us), keeping every client's tally
+  // and our own iVotedKick in sync. A rejection (rate-limited, etc.) thunks.
+  const voteKick = useCallback(
+    (targetId: string, vote: boolean) => {
+      emit("vote-kick", { targetId, vote }).catch(() => {
+        playCue(sharedAudioContext, "thunk");
+      });
+    },
+    [emit],
   );
 
   // While anyone is waiting at the door, loop the knock cue so participants
@@ -1645,11 +2145,16 @@ export function useMediasoup() {
     join,
     leave,
     decideJoinRequest,
+    voteKick,
     mute,
     unmute,
     toggleMute,
     toggleDeafen,
+    toggleDucking,
     toggleAudioShare,
+    startFileStream,
+    stopFileStream,
+    toggleFilePlayback,
     toggleRecording,
     startRecording,
     stopRecording,

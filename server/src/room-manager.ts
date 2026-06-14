@@ -12,6 +12,9 @@ import type { ChatMessage } from "./chat-util.js";
 export interface Peer {
   id: string;
   displayName: string;
+  // Best-effort client IP (see clientIp in signaling). Kept so a vote-to-kick
+  // can room-ban it on removal, the same soft ban a knock-deny applies.
+  ip: string;
   // Mirrors the client's mute toggle (set via producer-pause/-resume, which
   // fire in P2P mode too) so late joiners can render existing peers' state.
   muted: boolean;
@@ -46,6 +49,12 @@ export interface Room {
   // participant can reconnect/refresh without re-knocking. Sticky for the
   // room's lifetime.
   admittedTokens: Set<string>;
+  // Display names that have been admitted to this room (and not since denied),
+  // so someone who was let in earlier — then left — is auto-admitted if they
+  // come back under the same name instead of having to knock again. A denial
+  // removes the name (see join-decision). Soft, name-based, like bannedIps;
+  // sticky for the room's lifetime.
+  admittedNames: Set<string>;
   // Client IPs banned from this room because a participant denied their knock.
   // Checked on every join attempt to this room and refused outright (no knock).
   // Room-scoped and for the room's lifetime only (cleared when the room dies).
@@ -57,6 +66,11 @@ export interface Room {
   // stereo "share" producer (the voice track stays mono), which the server has
   // to route — so an active sharer forces SFU just like a caster does.
   sharers: Set<string>;
+  // Peer ids currently streaming a local file into the call. Like a share, a
+  // file stream is its own *separate* stereo "file" producer (independent of the
+  // voice track AND of any audio share), so the server has to route it — an
+  // active file streamer forces SFU just like a caster/sharer does.
+  fileStreamers: Set<string>;
   // Watches VOICE producers only (music producers are never added) to drive
   // auto-ducking: when someone talks, listeners lower the music peer's volume.
   audioLevelObserver: AudioLevelObserver;
@@ -64,6 +78,18 @@ export interface Room {
   // observer's events have been wired (done once per room in signaling).
   voiceActive: boolean;
   observerWired: boolean;
+  // Room-wide auto-ducking toggle (default on). When off, listeners stop
+  // ducking ALL music-type streams (caster, share, file) entirely — the level
+  // observer keeps running, but clients ignore the duck signal (gated in
+  // effectiveGain). Synced via the join response + a `ducking-changed`
+  // broadcast; persists for the room's lifetime.
+  duckingEnabled: boolean;
+  // Vote-to-kick tallies for a PUBLIC room (no moderators): target peerId ->
+  // the set of peerids who've voted to remove them. When a target's set reaches
+  // kickThreshold(votable peers) it's removed. A target's entry is cleared on
+  // kick; a voter's votes are dropped when they leave (see cleanupKickVotes).
+  // Only ever populated for public rooms.
+  kickVotes: Map<string, Set<string>>;
   // Rolling chat history (bounded to CHAT_HISTORY_MAX) so late joiners receive
   // recent messages on join. Newest last.
   messages: ChatMessage[];
@@ -108,22 +134,27 @@ export async function getOrCreateRoom(roomName: string): Promise<Room> {
     isPublic: false,
     pendingJoins: new Map(),
     admittedTokens: new Set(),
+    admittedNames: new Set(),
     bannedIps: new Set(),
     casters: new Set(),
     sharers: new Set(),
+    fileStreamers: new Set(),
     audioLevelObserver,
     voiceActive: false,
     observerWired: false,
+    duckingEnabled: true,
+    kickVotes: new Map(),
     messages: [],
   };
   rooms.set(roomName, room);
   return room;
 }
 
-export function createPeer(room: Room, peerId: string, displayName: string): Peer {
+export function createPeer(room: Room, peerId: string, displayName: string, ip: string): Peer {
   const peer: Peer = {
     id: peerId,
     displayName,
+    ip,
     muted: false,
     sendTransport: null,
     recvTransport: null,
