@@ -3,6 +3,8 @@
 
   "language_label": "Langue",
 
+  "footer_powered_by": "Propulsé par SonicRoom",
+
   "lobby_tagline": "Conférence audio stéréo à latence ultra-faible",
   "lobby_room_name_label": "Nom du salon",
   "lobby_room_name_placeholder": "mon-studio",
@@ -82,6 +84,7 @@
   "chat_send_title": "Envoyer (Entrée)",
   "chat_help": "Appuyez sur Entrée pour envoyer, Maj plus Entrée pour un saut de ligne. Appuyez sur Alt plus un chiffre de 1 à 0 pour entendre les dix derniers messages, du plus récent au plus ancien.",
   "chat_sent": "envoyé {time}",
+  "chat_copied": "Copié",
   "chat_joined": "{name} a rejoint",
   "chat_left": "{name} a quitté",
   "chat_just_now": "à l'instant",

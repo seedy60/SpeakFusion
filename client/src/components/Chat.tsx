@@ -1,8 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
 import { useRoomStore } from "../stores/room";
-import { relativeTime, META_SEP } from "../lib/chat";
+import { relativeTime, META_SEP, type ChatMessage } from "../lib/chat";
 import { m } from "../paraglide/messages.js";
+
+// What Ctrl+C copies: the message body only — no "sender:" prefix, no trailing
+// "sent …" time. Event rows copy their localized line (join/leave/system text).
+function messageContent(msg: ChatMessage): string {
+  if (msg.kind === "join") return m.chat_joined({ name: msg.sender });
+  if (msg.kind === "leave") return m.chat_left({ name: msg.sender });
+  return msg.text;
+}
 
 interface ChatProps {
   // Returns ok:false with a reason when nothing was sent, so we keep the text
@@ -17,6 +25,7 @@ interface ChatProps {
 // this panel is just the visible list + editor.
 export function Chat({ onSend, onClose }: ChatProps) {
   const messages = useRoomStore((s) => s.messages);
+  const announce = useRoomStore((s) => s.announce);
   const [text, setText] = useState("");
   // Active listbox option (roving via aria-activedescendant). -1 = none yet.
   const [activeIdx, setActiveIdx] = useState(-1);
@@ -57,6 +66,19 @@ export function Chat({ onSend, onClose }: ChatProps) {
   const onListKeyDown = (e: React.KeyboardEvent<HTMLUListElement>) => {
     if (messages.length === 0) return;
     const last = messages.length - 1;
+
+    // Ctrl/Cmd+C copies the focused message's content. A manual mouse selection
+    // takes precedence — let the browser copy that instead of overriding it.
+    if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "C")) {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      const msg = activeIdx >= 0 ? messages[activeIdx] : undefined;
+      if (!msg) return;
+      e.preventDefault();
+      void navigator.clipboard?.writeText(messageContent(msg)).then(() => announce(m.chat_copied()));
+      return;
+    }
+
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();

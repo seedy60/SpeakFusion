@@ -3,6 +3,8 @@
 
   "language_label": "Idioma",
 
+  "footer_powered_by": "Con tecnología de SonicRoom",
+
   "lobby_tagline": "Conferencia de audio estéreo de latencia ultrabaja",
   "lobby_room_name_label": "Nombre de la sala",
   "lobby_room_name_placeholder": "mi-estudio",
@@ -82,6 +84,7 @@
   "chat_send_title": "Enviar (Intro)",
   "chat_help": "Pulsa Intro para enviar, Mayús más Intro para una nueva línea. Pulsa Alt más un número del 1 al 0 para oír los últimos diez mensajes, del más reciente al más antiguo.",
   "chat_sent": "enviado {time}",
+  "chat_copied": "Copiado",
   "chat_joined": "{name} se unió",
   "chat_left": "{name} salió",
   "chat_just_now": "ahora mismo",

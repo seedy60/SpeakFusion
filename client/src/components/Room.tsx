@@ -9,6 +9,7 @@ import { AudioControls } from "./AudioControls";
 import { Chat } from "./Chat";
 import { JoinRequests } from "./JoinRequests";
 import { LanguageSelect } from "./LanguageSelect";
+import { Footer, PoweredBy } from "./Footer";
 import { m } from "../paraglide/messages.js";
 
 type JoinState = "idle" | "joining" | "joined" | "error";
@@ -224,26 +225,29 @@ export function Room() {
   // Loading state — or, for a public room, waiting to be let in (knock-to-join).
   if (joinState === "joining") {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-sonic-900">
-        <div className="flex max-w-sm flex-col items-center gap-4 px-4 text-center">
-          <Loader2 className="h-8 w-8 animate-spin text-sonic-accent" />
-          {/* One STABLE assertive live region (always mounted while joining), so
+      <div className="flex min-h-dvh flex-col bg-sonic-900">
+        <div className="flex flex-1 items-center justify-center">
+          <div className="flex max-w-sm flex-col items-center gap-4 px-4 text-center">
+            <Loader2 className="h-8 w-8 animate-spin text-sonic-accent" />
+            {/* One STABLE assertive live region (always mounted while joining), so
               the connecting → "waiting to be let in" change is reliably read out
               with priority — it interrupts other speech instead of queueing
               behind it. (Swapping a freshly-mounted region in/out announces
               unreliably, hence the single persistent node.) */}
-          <p className="text-sonic-300" role="alert" aria-live="assertive" aria-atomic="true">
-            {awaitingApproval ? m.room_awaiting_approval() : m.room_connecting()}
-          </p>
-          {awaitingApproval && (
-            <button
-              onClick={handleLeave}
-              className="rounded-lg bg-sonic-700 px-4 py-2 text-sm text-sonic-100 hover:bg-sonic-600"
-            >
-              {m.room_cancel_request()}
-            </button>
-          )}
+            <p className="text-sonic-300" role="alert" aria-live="assertive" aria-atomic="true">
+              {awaitingApproval ? m.room_awaiting_approval() : m.room_connecting()}
+            </p>
+            {awaitingApproval && (
+              <button
+                onClick={handleLeave}
+                className="rounded-lg bg-sonic-700 px-4 py-2 text-sm text-sonic-100 hover:bg-sonic-600"
+              >
+                {m.room_cancel_request()}
+              </button>
+            )}
+          </div>
         </div>
+        <Footer />
       </div>
     );
   }
@@ -251,16 +255,19 @@ export function Room() {
   // Error state
   if (joinState === "error") {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-sonic-900">
-        <div className="flex flex-col items-center gap-4 text-center">
-          <p className="text-lg text-muted">{errorMsg}</p>
-          <button
-            onClick={() => navigate("/")}
-            className="rounded-lg bg-sonic-accent px-4 py-2 text-sm text-white hover:bg-sonic-accent/90"
-          >
-            {m.room_back_to_lobby()}
-          </button>
+      <div className="flex min-h-dvh flex-col bg-sonic-900">
+        <div className="flex flex-1 items-center justify-center">
+          <div className="flex flex-col items-center gap-4 text-center">
+            <p className="text-lg text-muted">{errorMsg}</p>
+            <button
+              onClick={() => navigate("/")}
+              className="rounded-lg bg-sonic-accent px-4 py-2 text-sm text-white hover:bg-sonic-accent/90"
+            >
+              {m.room_back_to_lobby()}
+            </button>
+          </div>
         </div>
+        <Footer />
       </div>
     );
   }
@@ -379,8 +386,10 @@ export function Room() {
         {chatOpen && <Chat onSend={sendChatMessage} onClose={closeChat} />}
       </div>
 
-      {/* Bottom controls */}
-      <footer className="flex justify-center border-t border-sonic-700 p-4">
+      {/* Bottom controls + attribution. The "Powered by SonicRoom" link lives
+          inside this single footer landmark (rather than a second <Footer />) so
+          the active call keeps exactly one `contentinfo`. */}
+      <footer className="flex flex-col items-center gap-2 border-t border-sonic-700 p-4">
         <AudioControls
           onToggleMute={toggleMute}
           onToggleAudioShare={toggleAudioShare}
@@ -389,6 +398,7 @@ export function Room() {
           onStopStreaming={stopStreaming}
           onLeave={handleLeave}
         />
+        <PoweredBy />
       </footer>
 
       {/* Screen reader announcements (peer join/leave, recording, etc.).

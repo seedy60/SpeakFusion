@@ -3,6 +3,8 @@
 
   "language_label": "Language",
 
+  "footer_powered_by": "Powered by SonicRoom",
+
   "lobby_tagline": "Ultra-low-latency stereo audio conferencing",
   "lobby_room_name_label": "Room Name",
   "lobby_room_name_placeholder": "my-studio",
@@ -82,6 +84,7 @@
   "chat_send_title": "Send (Enter)",
   "chat_help": "Press Enter to send, Shift plus Enter for a new line. Press Alt plus a number from 1 to 0 to hear the last ten messages, newest first.",
   "chat_sent": "sent {time}",
+  "chat_copied": "Copied",
   "chat_joined": "{name} joined",
   "chat_left": "{name} left",
   "chat_just_now": "just now",
