@@ -32,6 +32,10 @@ export interface Room {
   // Pins the room to the SFU even with <=2 peers; sticky for the room's
   // lifetime once any joiner sets it (see decideMode's forceSfu).
   disableP2p: boolean;
+  // Whether this room is publicly listed in the lobby (via the "Make this room
+  // public" toggle / `?public=true` URL param). Private by default; sticky for
+  // the room's lifetime once any joiner sets it. Listed by getPublicRooms.
+  isPublic: boolean;
   // Peer ids of send-only "music caster" peers (e.g. Ecobox). While any are
   // present the room is forced to SFU (see decideMode's forceSfu).
   casters: Set<string>;
@@ -87,6 +91,7 @@ export async function getOrCreateRoom(roomName: string): Promise<Room> {
     peers: new Map(),
     mode: "p2p",
     disableP2p: false,
+    isPublic: false,
     casters: new Set(),
     sharers: new Set(),
     audioLevelObserver,
@@ -148,4 +153,20 @@ export function removePeer(room: Room, peerId: string) {
 
 export function getRooms() {
   return rooms;
+}
+
+// Snapshot of the currently-live PUBLIC rooms for the lobby list: each room's
+// name plus the display names of everyone currently in it. Private rooms are
+// omitted entirely. Rooms only exist while they hold at least one peer, so
+// `participants` is never empty.
+export function getPublicRooms(): { name: string; participants: string[] }[] {
+  const out: { name: string; participants: string[] }[] = [];
+  for (const room of rooms.values()) {
+    if (!room.isPublic) continue;
+    out.push({
+      name: room.name,
+      participants: Array.from(room.peers.values()).map((p) => p.displayName),
+    });
+  }
+  return out;
 }

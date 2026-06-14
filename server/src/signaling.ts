@@ -14,6 +14,7 @@ import {
 } from "./room-manager.js";
 import { decideMode } from "./recording-util.js";
 import { RateLimiter, CHAT_HISTORY_MAX, CHAT_TEXT_MAX, type ChatMessage } from "./chat-util.js";
+import { notifyPublicRoomCreated, notifyPublicRoomJoin } from "./notify.js";
 import type { RecordingManager, ProducerInfo } from "./recording.js";
 import type { StreamManager } from "./streaming.js";
 import type { IcecastConfig } from "./streaming-util.js";
@@ -74,6 +75,9 @@ const joinSchema = z.object({
   // Explicitly disable P2P for this room (the `?p2p=off` room URL param). Pins
   // the room to the SFU even with <=2 peers; sticky once any joiner sets it.
   disableP2p: z.boolean().optional(),
+  // List this room publicly in the lobby (the "Make this room public" toggle /
+  // `?public=true` URL param). Off by default; sticky once any joiner sets it.
+  isPublic: z.boolean().optional(),
   // Set on a reconnect if this peer was sharing audio when it dropped, so the
   // server re-pins SFU for the rejoin (the share producer is rebuilt right
   // after, in setupSfu). On a first join it's always false.
@@ -234,11 +238,16 @@ export function createSignalingServer(
 
     socket.on("join", async (data: unknown, cb: (res: unknown) => void) => {
       try {
-        const { roomName, displayName, role, disableP2p, sharing } = joinSchema.parse(data);
+        const { roomName, displayName, role, disableP2p, isPublic, sharing } =
+          joinSchema.parse(data);
         console.log(
-          `[ws] ${socket.id} joined ${roomName} as "${displayName}"${role ? ` (${role})` : ""}${disableP2p ? " (p2p disabled)" : ""}`,
+          `[ws] ${socket.id} joined ${roomName} as "${displayName}"${role ? ` (${role})` : ""}${disableP2p ? " (p2p disabled)" : ""}${isPublic ? " (public)" : ""}`,
         );
         const room = await getOrCreateRoom(roomName);
+        // Capture before this join can flip the (sticky) public flag below, so
+        // we can tell "this join just made the room public" (a public room is
+        // born) apart from "joined an already-public room".
+        const wasPublic = room.isPublic;
         wireDucking(room);
         const peer = createPeer(room, socket.id, displayName);
 
@@ -247,6 +256,8 @@ export function createSignalingServer(
         // forced-SFU room. disableP2p is sticky for the room's lifetime.
         if (role === "caster") room.casters.add(socket.id);
         if (disableP2p) room.disableP2p = true;
+        // Public listing is sticky for the room's lifetime, like disableP2p.
+        if (isPublic) room.isPublic = true;
         // A peer reconnecting mid-share re-pins SFU before the mode is decided,
         // so the rejoin lands straight in SFU and its share producer rebuilds.
         if (sharing) room.sharers.add(socket.id);
@@ -261,6 +272,14 @@ export function createSignalingServer(
           peerId: socket.id,
           displayName,
         });
+
+        // Ping the operator's off-box noty daemon on public-room activity
+        // (target + on/off live in .env, hidden from users). Fire-and-forget:
+        // either the room was just made public (born) or it already was.
+        if (room.isPublic) {
+          if (!wasPublic) notifyPublicRoomCreated(roomName, displayName);
+          else notifyPublicRoomJoin(roomName, displayName, room.peers.size);
+        }
 
         // Send existing peers to the new joiner. Each producer carries its
         // `source` ("voice" | "music") so a late joiner can label/treat the

@@ -20,6 +20,15 @@ function isP2pDisabled(value: string | null): boolean {
   return ["off", "false", "0", "no", "disable", "disabled"].includes(v);
 }
 
+// `?public=true` (also accepts 1/yes/on/enable/enabled/public) lists this room
+// in the lobby's public directory — flows from the lobby's "Make this room
+// public" toggle, and is sticky for the room's lifetime once any joiner sets it.
+function isPublicEnabled(value: string | null): boolean {
+  if (value == null) return false;
+  const v = value.toLowerCase();
+  return ["true", "1", "yes", "on", "enable", "enabled", "public"].includes(v);
+}
+
 // When embedded in an iframe (e.g. jitchat), mirror room lifecycle events to the
 // host page via postMessage so it can play sounds / reset its view. The event
 // names match the Jitsi External API events the host previously relied on. No-op
@@ -40,6 +49,7 @@ export function Room() {
   const disableP2p =
     isP2pDisabled(searchParams.get("p2p")) ||
     (p2pStorageKey != null && sessionStorage.getItem(p2pStorageKey) === "1");
+  const makePublic = isPublicEnabled(searchParams.get("public"));
   const navigate = useNavigate();
   const {
     join,
@@ -121,13 +131,13 @@ export function Room() {
     // re-asserts it even without the URL param.
     if (disableP2p && p2pStorageKey) sessionStorage.setItem(p2pStorageKey, "1");
 
-    join(roomName, name, { disableP2p })
+    join(roomName, name, { disableP2p, isPublic: makePublic })
       .then(() => setJoinState("joined"))
       .catch((err) => {
         setJoinState("error");
         setErrorMsg(err instanceof Error ? err.message : m.room_failed_to_join());
       });
-  }, [roomName, join, navigate, disableP2p, p2pStorageKey, searchParams]);
+  }, [roomName, join, navigate, disableP2p, makePublic, p2pStorageKey, searchParams]);
 
   // Mirror room lifecycle to the host page when embedded (see postToHost).
   useEffect(() => {

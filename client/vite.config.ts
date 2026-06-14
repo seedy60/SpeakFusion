@@ -16,6 +16,23 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  build: {
+    rollupOptions: {
+      output: {
+        // Split the heavy, rarely-changing third-party code out of the app
+        // bundle. mediasoup-client is the largest dependency, so it gets its
+        // own chunk; everything else from node_modules shares a vendor chunk.
+        // Beyond silencing the 500 kB chunk-size warning, this matters for our
+        // deploy model: client redeploys are frequent (`pnpm build` only), but
+        // these chunks rarely change, so returning users keep them cached.
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return;
+          if (id.includes("mediasoup-client")) return "mediasoup";
+          return "vendor";
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     proxy: {

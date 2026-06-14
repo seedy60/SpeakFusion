@@ -786,7 +786,11 @@ export function useMediasoup() {
 
   // --- Main join ---
   const join = useCallback(
-    async (roomName: string, displayName: string, opts?: { disableP2p?: boolean }) => {
+    async (
+      roomName: string,
+      displayName: string,
+      opts?: { disableP2p?: boolean; isPublic?: boolean },
+    ) => {
       // Acquire stereo audio + build the outgoing graph BEFORE connecting so
       // it's ready the moment we (re)join. The mic, AudioContext and outgoing
       // track are reused for the whole session and survive reconnects, so a
@@ -823,6 +827,8 @@ export function useMediasoup() {
           roomName,
           displayName,
           disableP2p: opts?.disableP2p,
+          // List this room in the lobby's public directory (sticky server-side).
+          isPublic: opts?.isPublic,
           // On a reconnect mid-share, re-pin SFU so the share rebuilds.
           sharing: store.getState().isSharingAudio,
         });

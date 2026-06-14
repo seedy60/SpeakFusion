@@ -6,14 +6,26 @@ import path from "node:path";
 import { createWorker } from "mediasoup";
 import type { Worker } from "mediasoup/types";
 import { workerSettings, numWorkers } from "./mediasoup-config.js";
-import { setWorkers } from "./room-manager.js";
+import { setWorkers, getPublicRooms } from "./room-manager.js";
 import { createSignalingServer } from "./signaling.js";
 import { RecordingManager } from "./recording.js";
 import { StreamManager } from "./streaming.js";
 import { createZipStream } from "./zip-stream.js";
 
-const PORT = parseInt(process.env.PORT || "3100", 10);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load local secrets/config from the repo-root .env (NOTY_* notification target,
+// etc.) before anything reads process.env. tsx/Node don't auto-load it, and it's
+// gitignored + hidden from the app UI on purpose; an absent file is fine (the
+// .env-gated features simply stay off). Resolved from this file, not cwd, since
+// `pnpm --filter server start` runs with the server package as cwd.
+try {
+  process.loadEnvFile(path.resolve(__dirname, "../../.env"));
+} catch {
+  /* no .env present — fine */
+}
+
+const PORT = parseInt(process.env.PORT || "3100", 10);
 
 async function main() {
   // Create mediasoup workers
@@ -58,6 +70,13 @@ async function main() {
       return;
     }
     res.status(201).json({ ok: true, message: result.message });
+  });
+
+  // Public room directory for the lobby: the live, publicly-listed rooms and who
+  // is currently in each. Private rooms are never included. Polled by the lobby
+  // (the visitor isn't connected to a socket yet), so it's a plain GET.
+  app.get("/api/public-rooms", (_req, res) => {
+    res.json({ rooms: getPublicRooms() });
   });
 
   // Recording download — mixes all participants' captured audio into a single

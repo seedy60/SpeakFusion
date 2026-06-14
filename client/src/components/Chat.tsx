@@ -126,7 +126,6 @@ export function Chat({ onSend, onClose }: ChatProps) {
           tabIndex={0}
           aria-label={m.chat_messages_label()}
           aria-activedescendant={activeId}
-          aria-keyshortcuts="ArrowUp ArrowDown Home End"
           onKeyDown={onListKeyDown}
           onFocus={() => setActiveIdx((i) => (i < 0 ? messages.length - 1 : i))}
           className="flex-1 space-y-1 overflow-y-auto px-2 py-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-sonic-accent/60"
