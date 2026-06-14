@@ -1,6 +1,6 @@
 /**
- * Force low-latency mono Opus params in SDP.
- * Ensures useinbandfec=1, maxaveragebitrate=64000, mono,
+ * Force low-latency stereo Opus params in SDP.
+ * Ensures useinbandfec=1, maxaveragebitrate=128000, stereo,
  * and minptime=10 for lowest packetization delay.
  */
 export function forceOpusParams(sdp: string): string {
@@ -21,11 +21,11 @@ export function forceOpusParams(sdp: string): string {
         if (k) params.set(k, v ?? "");
       }
 
-      // Force mono low-latency params
-      params.set("stereo", "0");
-      params.set("sprop-stereo", "0");
+      // Force stereo low-latency params
+      params.set("stereo", "1");
+      params.set("sprop-stereo", "1");
       params.set("useinbandfec", "1");
-      params.set("maxaveragebitrate", "64000");
+      params.set("maxaveragebitrate", "128000");
       params.set("minptime", "10");
       params.set("ptime", "10");
       params.set("maxplaybackrate", "48000");

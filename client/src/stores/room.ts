@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { ChatMessage } from "../lib/chat";
 import { getLocale, setLocale as applyParaglideLocale, type Locale } from "../lib/i18n";
+import { isIOS } from "../lib/microphone";
 
 // Keep the in-memory chat bounded; the server caps history too. Newest last.
 const CHAT_MESSAGES_MAX = 200;
@@ -24,6 +25,7 @@ function loadMicGain(): number {
 // micGain: persisted, and carried from the lobby preview into the call.
 const MIC_DEVICE_KEY = "sonicroom:micDeviceId";
 const SPEAKER_DEVICE_KEY = "sonicroom:speakerDeviceId";
+const VOICE_PROCESSING_KEY = "sonicroom:voiceProcessing";
 
 function loadString(key: string): string {
   try {
@@ -38,6 +40,15 @@ function saveString(key: string, value: string) {
     localStorage.setItem(key, value);
   } catch {
     // Persistence is best-effort; keep the in-memory value regardless.
+  }
+}
+
+function loadVoiceProcessing(): boolean {
+  try {
+    const value = localStorage.getItem(VOICE_PROCESSING_KEY);
+    return value == null ? isIOS : value === "true";
+  } catch {
+    return isIOS;
   }
 }
 
@@ -139,6 +150,9 @@ interface RoomState {
   // and the in-call media graph both follow these (see DeviceSettings).
   micDeviceId: string;
   speakerDeviceId: string;
+  // Browser voice processing (echo cancellation, noise suppression and
+  // automatic gain). Defaults on for iOS/iPadOS and off elsewhere.
+  voiceProcessingEnabled: boolean;
 
   // Recording (a recording belongs to the room; visible to everyone)
   isRecording: boolean;
@@ -199,6 +213,7 @@ interface RoomState {
   setMicGain: (gain: number) => void;
   setMicDeviceId: (deviceId: string) => void;
   setSpeakerDeviceId: (deviceId: string) => void;
+  setVoiceProcessingEnabled: (enabled: boolean) => void;
   setRecording: (recording: boolean, recordingId?: string | null) => void;
   setStreaming: (streaming: boolean) => void;
   setStreamConfig: (config: StreamConfig) => void;
@@ -240,6 +255,7 @@ export const useRoomStore = create<RoomState>((set) => ({
   micGain: loadMicGain(),
   micDeviceId: loadString(MIC_DEVICE_KEY),
   speakerDeviceId: loadString(SPEAKER_DEVICE_KEY),
+  voiceProcessingEnabled: loadVoiceProcessing(),
   isRecording: false,
   recordingId: null,
   isStreaming: false,
@@ -287,6 +303,10 @@ export const useRoomStore = create<RoomState>((set) => ({
   setSpeakerDeviceId: (speakerDeviceId) => {
     saveString(SPEAKER_DEVICE_KEY, speakerDeviceId);
     set({ speakerDeviceId });
+  },
+  setVoiceProcessingEnabled: (voiceProcessingEnabled) => {
+    saveString(VOICE_PROCESSING_KEY, String(voiceProcessingEnabled));
+    set({ voiceProcessingEnabled });
   },
   setRecording: (isRecording, recordingId) =>
     set((s) => ({

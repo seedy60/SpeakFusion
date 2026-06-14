@@ -4,6 +4,7 @@ import { Device } from "mediasoup-client";
 import type { Transport, Producer, Consumer } from "mediasoup-client/types";
 import { forceOpusParams } from "../lib/sdp-munger";
 import { applySpeakerToContext } from "../lib/audio-devices";
+import { isIOS, microphoneConstraints } from "../lib/microphone";
 import { playCue, startKnockLoop } from "../lib/sounds";
 import { formatMessage, RateLimiter, META_SEP, type ChatMessage } from "../lib/chat";
 import {
@@ -91,34 +92,6 @@ const ICE_SERVERS: RTCIceServer[] = [
     credential: "sin6V0gFokHz78gM0GDfXmat",
   },
 ];
-
-// iOS/iPadOS Safari (iPadOS now reports as "MacIntel" + touch). WebKit's audio
-// stack is behind the "sample rate keeps breaking" reports: it fights a forced
-// AudioContext/getUserMedia sample rate that doesn't match the current hardware
-// route, and it drops the whole context into an "interrupted" state on any route
-// change (Bluetooth/headset connect, the session flipping to voice-chat when a
-// peer joins, Siri, backgrounding).
-const isIOS =
-  typeof navigator !== "undefined" &&
-  (/iP(hone|ad|od)/.test(navigator.userAgent) ||
-    // iPadOS 13+ reports a desktop "Macintosh" UA; a touch-capable Mac is one.
-    (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1));
-
-// Mic constraints. On iOS we drop the sample-rate hint: forcing a rate the
-// current route can't honour (e.g. a Bluetooth headset locked to 16 kHz) yields
-// garbled/pitched capture. WebRTC/Opus negotiates its own rate regardless.
-// The selected mic is `ideal`, not `exact`, so a remembered-but-unplugged
-// device falls back to the default instead of failing the join.
-function micConstraints(channelCount: 1 | 2, deviceId?: string): MediaTrackConstraints {
-  return {
-    channelCount,
-    ...(isIOS ? {} : { sampleRate: 48000 }),
-    echoCancellation: false,
-    noiseSuppression: false,
-    autoGainControl: false,
-    ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
-  };
-}
 
 // Shared AudioContext — single output buffer for all peers (lower latency than
 // one per peer). On iOS we let it adopt the device-native rate instead of pinning
@@ -244,8 +217,8 @@ export function useMediasoup() {
     limiter: DynamicsCompressorNode;
     outDest: MediaStreamAudioDestinationNode;
     displaySource: MediaStreamAudioSourceNode | null;
-    // Shared system/tab audio gets its OWN destination so it's produced as a
-    // separate stereo "share" track — the voice track (outDest) stays mono.
+    // Shared system/tab audio gets its OWN destination so it is produced as a
+    // separate high-bitrate stereo "share" track.
     shareDest: MediaStreamAudioDestinationNode | null;
     // A streamed local file gets its OWN destination too, so it's produced as a
     // separate stereo "file" track, independent of voice AND of any share. The
@@ -268,7 +241,7 @@ export function useMediasoup() {
   // ended/error listeners (so swapping the file never fires a stale handler).
   const fileProducerRef = useRef<Producer | null>(null);
   const fileAudioRef = useRef<HTMLAudioElement | null>(null);
-  const fileUrlRef = useRef<string | null>(null);
+  const fileObjectUrlRef = useRef<string | null>(null);
   const fileAbortRef = useRef<AbortController | null>(null);
   // Other peers' incoming file streams: producerId -> owner peerId, mirroring
   // shareOwnersRef so a peer can stream a file AND share system audio at once
@@ -467,6 +440,7 @@ export function useMediasoup() {
   // --- Device selection (set in the lobby or via the in-call settings) ---
   const micDeviceId = useRoomStore((s) => s.micDeviceId);
   const speakerDeviceId = useRoomStore((s) => s.speakerDeviceId);
+  const voiceProcessingEnabled = useRoomStore((s) => s.voiceProcessingEnabled);
 
   // All incoming audio plays through the shared context, so the speaker pick
   // is one setSinkId there — it covers every peer, current and future.
@@ -474,21 +448,26 @@ export function useMediasoup() {
     applySpeakerToContext(sharedAudioContext, speakerDeviceId);
   }, [speakerDeviceId]);
 
-  // Mid-call mic switch: re-acquire the mic on the new device and reroute it
-  // into the outgoing graph. Senders/producers never see the swap — they
-  // always carry outDest's track. Guarded by a prev-ref so it only runs on an
-  // actual change; before a call (no local stream) join() picks the device up.
-  const prevMicDeviceRef = useRef(micDeviceId);
+  // Mid-call mic setting change: re-acquire the mic with the selected device
+  // and voice-processing preference, then reroute it into the outgoing graph.
+  // Senders/producers never see the swap because they always carry outDest's
+  // track. Before a call (no local stream), join() picks the settings up.
+  const prevMicSettingsRef = useRef({ micDeviceId, voiceProcessingEnabled });
   useEffect(() => {
-    if (prevMicDeviceRef.current === micDeviceId) return;
-    prevMicDeviceRef.current = micDeviceId;
+    const previous = prevMicSettingsRef.current;
+    if (
+      previous.micDeviceId === micDeviceId &&
+      previous.voiceProcessingEnabled === voiceProcessingEnabled
+    )
+      return;
+    prevMicSettingsRef.current = { micDeviceId, voiceProcessingEnabled };
     if (!localStreamRef.current) return;
     let cancelled = false;
     void (async () => {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: micConstraints(2, micDeviceId),
+          audio: microphoneConstraints(micDeviceId, voiceProcessingEnabled),
         });
       } catch (err) {
         console.error("[mic] device switch failed:", err);
@@ -508,7 +487,7 @@ export function useMediasoup() {
     return () => {
       cancelled = true;
     };
-  }, [micDeviceId, connectMicToGraph, store]);
+  }, [micDeviceId, voiceProcessingEnabled, connectMicToGraph, store]);
 
   // --- P2P: create a peer connection ---
   const ensureLocalStream = useCallback(async () => {
@@ -518,7 +497,10 @@ export function useMediasoup() {
 
     // Re-acquire mic (on the user's selected device, if any)
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: micConstraints(1, useRoomStore.getState().micDeviceId),
+      audio: microphoneConstraints(
+        useRoomStore.getState().micDeviceId,
+        useRoomStore.getState().voiceProcessingEnabled,
+      ),
     });
     localStreamRef.current = stream;
     connectMicToGraph(stream);
@@ -676,7 +658,7 @@ export function useMediasoup() {
       const pipeline = createAudioPipeline(consumer.track);
 
       // A "share" is a peer casting system/tab audio as a SEPARATE stereo
-      // producer (their voice stays its own mono track). Represent it as its
+      // producer. Represent it as its
       // own "music stream" participant keyed by the producer id, so a peer that
       // produces BOTH voice and a share never collides in the peer/audio maps.
       // Stereo is preserved end-to-end by createAudioPipeline.
@@ -729,9 +711,9 @@ export function useMediasoup() {
   );
 
   // Produce the shared system/tab audio as a SEPARATE stereo, hi-fi "share"
-  // track (the router's 256 kbps ceiling lets it negotiate full quality). The
-  // voice producer is untouched, so voice stays mono/64k. SFU-only — an active
-  // share forces the room onto the SFU server-side. Idempotent.
+  // track (the router's 256 kbps ceiling lets it negotiate full quality).
+  // SFU-only — an active share forces the room onto the SFU server-side.
+  // Idempotent.
   const produceShare = useCallback(async () => {
     const sendTransport = sendTransportRef.current;
     const device = deviceRef.current;
@@ -904,10 +886,11 @@ export function useMediasoup() {
       const producer = await sendTransport.produce({
         track: ensureOutGraph().outDest.stream.getAudioTracks()[0],
         codecOptions: {
-          opusStereo: false,
+          opusStereo: true,
           opusDtx: false,
           opusFec: true,
           opusMaxPlaybackRate: 48000,
+          opusMaxAverageBitrate: 128000,
         },
         codec: device.recvRtpCapabilities.codecs?.find(
           (c) => c.mimeType.toLowerCase() === "audio/opus",
@@ -974,7 +957,10 @@ export function useMediasoup() {
       // track are reused for the whole session and survive reconnects, so a
       // network blip never re-prompts for the mic or rebuilds the send chain.
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: micConstraints(2, store.getState().micDeviceId),
+        audio: microphoneConstraints(
+          store.getState().micDeviceId,
+          store.getState().voiceProcessingEnabled,
+        ),
       });
       localStreamRef.current = stream;
       connectMicToGraph(stream);
@@ -1712,7 +1698,7 @@ export function useMediasoup() {
 
   // --- Audio share: cast system/tab audio as a SEPARATE stereo producer ---
   // The shared audio gets its own destination (shareDest) and its own stereo
-  // "share" producer, so the voice track stays mono/64k and is never touched.
+  // "share" producer, so the voice track is never touched.
   const detachSharedAudio = useCallback(() => {
     const g = outGraphRef.current;
     g?.displaySource?.disconnect();
@@ -1780,7 +1766,7 @@ export function useMediasoup() {
     displayStream.getVideoTracks().forEach((t) => t.stop());
 
     // Route the shared audio into its OWN destination (not the voice graph), so
-    // it becomes a separate stereo producer and the voice track stays mono.
+    // it becomes a separate high-bitrate stereo producer.
     const g = ensureOutGraph();
     const shareDest = sharedAudioContext.createMediaStreamDestination();
     const displaySource = sharedAudioContext.createMediaStreamSource(new MediaStream(audioTracks));
@@ -1841,9 +1827,9 @@ export function useMediasoup() {
         fileAudioRef.current.src = "";
         fileAudioRef.current = null;
       }
-      if (fileUrlRef.current) {
-        URL.revokeObjectURL(fileUrlRef.current);
-        fileUrlRef.current = null;
+      if (fileObjectUrlRef.current) {
+        URL.revokeObjectURL(fileObjectUrlRef.current);
+        fileObjectUrlRef.current = null;
       }
       store.getState().setFileStream(null);
       store.getState().setFileStreamPlaying(false);
@@ -1856,8 +1842,8 @@ export function useMediasoup() {
     [store, emit],
   );
 
-  const startFileStream = useCallback(
-    async (file: File) => {
+  const startFileSource = useCallback(
+    async (src: string, name: string, objectUrl?: string) => {
       const g = ensureOutGraph();
       resumeSharedContext();
 
@@ -1875,16 +1861,16 @@ export function useMediasoup() {
         fileAudioRef.current.src = "";
         fileAudioRef.current = null;
       }
-      if (fileUrlRef.current) {
-        URL.revokeObjectURL(fileUrlRef.current);
-        fileUrlRef.current = null;
+      if (fileObjectUrlRef.current) {
+        URL.revokeObjectURL(fileObjectUrlRef.current);
+        fileObjectUrlRef.current = null;
       }
 
-      // New <audio> element decoding the chosen file.
-      const url = URL.createObjectURL(file);
-      fileUrlRef.current = url;
+      // New <audio> element decoding a local object URL or same-origin server
+      // source (library file / proxied public URL).
+      fileObjectUrlRef.current = objectUrl ?? null;
       const audioEl = new Audio();
-      audioEl.src = url;
+      audioEl.src = src;
       (audioEl as unknown as Record<string, boolean>).playsInline = true;
       fileAudioRef.current = audioEl;
 
@@ -1906,7 +1892,7 @@ export function useMediasoup() {
         signal: ac.signal,
       });
 
-      store.getState().setFileStream(file.name);
+      store.getState().setFileStream(name);
       try {
         await audioEl.play();
         store.getState().setFileStreamPlaying(true);
@@ -1927,10 +1913,40 @@ export function useMediasoup() {
         playCue(sharedAudioContext, "share-start");
       } else {
         // Replacing the file mid-stream — producer/SFU pin are unchanged.
-        store.getState().announce(file_player_streaming({ name: file.name }));
+        store.getState().announce(file_player_streaming({ name }));
       }
     },
     [store, ensureOutGraph, emit, produceFile, stopFileStream],
+  );
+
+  const startFileStream = useCallback(
+    async (file: File) => {
+      const objectUrl = URL.createObjectURL(file);
+      try {
+        await startFileSource(objectUrl, file.name, objectUrl);
+      } catch (err) {
+        URL.revokeObjectURL(objectUrl);
+        throw err;
+      }
+    },
+    [startFileSource],
+  );
+
+  const startUrlStream = useCallback(
+    async (rawUrl: string) => {
+      const url = new URL(rawUrl);
+      if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Invalid URL");
+      const name = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() ?? url.hostname);
+      await startFileSource(`/api/audio-proxy?url=${encodeURIComponent(url.href)}`, name);
+    },
+    [startFileSource],
+  );
+
+  const startServerFileStream = useCallback(
+    async (name: string) => {
+      await startFileSource(`/api/audio-library/${encodeURIComponent(name)}`, name);
+    },
+    [startFileSource],
   );
 
   const toggleFilePlayback = useCallback(() => {
@@ -2062,9 +2078,9 @@ export function useMediasoup() {
       fileAudioRef.current.src = "";
       fileAudioRef.current = null;
     }
-    if (fileUrlRef.current) {
-      URL.revokeObjectURL(fileUrlRef.current);
-      fileUrlRef.current = null;
+    if (fileObjectUrlRef.current) {
+      URL.revokeObjectURL(fileObjectUrlRef.current);
+      fileObjectUrlRef.current = null;
     }
     teardownP2p();
     teardownSfu();
@@ -2153,6 +2169,8 @@ export function useMediasoup() {
     toggleDucking,
     toggleAudioShare,
     startFileStream,
+    startUrlStream,
+    startServerFileStream,
     stopFileStream,
     toggleFilePlayback,
     toggleRecording,

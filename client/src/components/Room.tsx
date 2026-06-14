@@ -7,6 +7,7 @@ import { formatMessage, messageContent } from "../lib/chat";
 import { ParticipantCard } from "./ParticipantCard";
 import { AudioControls } from "./AudioControls";
 import { FileStreamPlayer } from "./FileStreamPlayer";
+import { AudioSourceDialog } from "./AudioSourceDialog";
 import { Chat } from "./Chat";
 import { JoinRequests } from "./JoinRequests";
 import { LanguageSelect } from "./LanguageSelect";
@@ -65,6 +66,8 @@ export function Room() {
     toggleDucking,
     toggleAudioShare,
     startFileStream,
+    startUrlStream,
+    startServerFileStream,
     stopFileStream,
     toggleFilePlayback,
     toggleRecording,
@@ -80,6 +83,7 @@ export function Room() {
   const [joinState, setJoinState] = useState<JoinState>("idle");
   const [errorMsg, setErrorMsg] = useState("");
   const [chatOpen, setChatOpen] = useState(false);
+  const [audioSourceOpen, setAudioSourceOpen] = useState(false);
   // Bumped to (re)focus the chat composer even when the panel is already open —
   // used to hand focus to the call after the knock-to-join modal closes.
   const [chatFocusSignal, setChatFocusSignal] = useState(0);
@@ -107,11 +111,12 @@ export function Room() {
     setChatFocusSignal((n) => n + 1);
   }, []);
 
-  // Hidden picker for the "stream a file" feature. `f` (and the idle toolbar
-  // button) opens it; choosing a file starts — or, mid-stream, replaces — the
-  // stream. The floating FileStreamPlayer handles play/pause + stop after that.
+  // Hidden local-file picker used by the audio-source chooser. Choosing a file
+  // starts — or, mid-stream, replaces — the stream. The floating player handles
+  // play/pause + stop after that.
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pickFile = useCallback(() => {
+    setAudioSourceOpen(false);
     fileInputRef.current?.click();
   }, []);
   const onFileChosen = useCallback(
@@ -123,11 +128,11 @@ export function Room() {
     },
     [startFileStream],
   );
-  // Toolbar button: stop an active stream, otherwise open the picker.
+  // Toolbar button: stop an active stream, otherwise open the source chooser.
   const toggleFileStream = useCallback(() => {
     if (useRoomStore.getState().fileStreamName != null) void stopFileStream();
-    else pickFile();
-  }, [stopFileStream, pickFile]);
+    else setAudioSourceOpen(true);
+  }, [stopFileStream]);
 
   const localPeerId = useRoomStore((s) => s.localPeerId);
   const displayName = useRoomStore((s) => s.displayName);
@@ -275,9 +280,9 @@ export function Room() {
         e.preventDefault();
         toggleAudioShare();
       } else if (e.key === "f" || e.key === "F") {
-        // Pick a file to stream (mid-stream, picking a new one replaces it).
+        // Open the audio-source chooser.
         e.preventDefault();
-        pickFile();
+        setAudioSourceOpen(true);
       } else if (e.key === "d" || e.key === "D") {
         // Toggle room-wide auto-ducking.
         e.preventDefault();
@@ -292,7 +297,7 @@ export function Room() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [joinState, toggleMute, toggleAudioShare, pickFile, toggleDucking, toggleRecording]);
+  }, [joinState, toggleMute, toggleAudioShare, toggleDucking, toggleRecording]);
 
   const handleLeave = useCallback(() => {
     postToHost("readyToClose");
@@ -527,7 +532,16 @@ export function Room() {
           Self-hides when nobody is waiting. */}
       <JoinRequests onDecide={decideJoinRequest} onCleared={onJoinRequestsCleared} />
 
-      {/* Hidden picker for "stream a file" (opened by `f` / the toolbar button). */}
+      {audioSourceOpen && (
+        <AudioSourceDialog
+          onClose={() => setAudioSourceOpen(false)}
+          onChooseComputerFile={pickFile}
+          onStartUrl={startUrlStream}
+          onStartServerFile={startServerFileStream}
+        />
+      )}
+
+      {/* Hidden local-file picker opened from the audio-source chooser. */}
       <input
         ref={fileInputRef}
         type="file"

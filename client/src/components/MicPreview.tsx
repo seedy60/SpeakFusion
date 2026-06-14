@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { useRoomStore, MAX_MIC_GAIN } from "../stores/room";
 import { applySpeakerToContext } from "../lib/audio-devices";
+import { microphoneConstraints } from "../lib/microphone";
 import { DeviceSettings } from "./DeviceSettings";
 import { m } from "../paraglide/messages.js";
 
@@ -56,6 +57,7 @@ export function MicPreview() {
   const setMicGain = useRoomStore((s) => s.setMicGain);
   const micDeviceId = useRoomStore((s) => s.micDeviceId);
   const speakerDeviceId = useRoomStore((s) => s.speakerDeviceId);
+  const voiceProcessingEnabled = useRoomStore((s) => s.voiceProcessingEnabled);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState("");
 
@@ -108,13 +110,10 @@ export function MicPreview() {
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          ...(micId ? { deviceId: { ideal: micId } } : {}),
-        },
+        audio: microphoneConstraints(
+          micId,
+          useRoomStore.getState().voiceProcessingEnabled,
+        ),
       });
     } catch {
       setError(m.mic_permission_error());
@@ -195,15 +194,20 @@ export function MicPreview() {
   // Restart an active preview on the newly picked mic. Guarded by a prev-ref
   // so unrelated dep identity changes (the gain slider re-creating `start`)
   // never restart the test mid-adjustment.
-  const prevMicDeviceRef = useRef(micDeviceId);
+  const prevMicSettingsRef = useRef({ micDeviceId, voiceProcessingEnabled });
   useEffect(() => {
-    if (prevMicDeviceRef.current === micDeviceId) return;
-    prevMicDeviceRef.current = micDeviceId;
+    const previous = prevMicSettingsRef.current;
+    if (
+      previous.micDeviceId === micDeviceId &&
+      previous.voiceProcessingEnabled === voiceProcessingEnabled
+    )
+      return;
+    prevMicSettingsRef.current = { micDeviceId, voiceProcessingEnabled };
     if (streamRef.current) {
       stop();
       void start();
     }
-  }, [micDeviceId, stop, start]);
+  }, [micDeviceId, voiceProcessingEnabled, stop, start]);
 
   // Live-apply a speaker change to an active preview's context.
   useEffect(() => {

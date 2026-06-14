@@ -22,8 +22,8 @@ import { m } from "../paraglide/messages.js";
 interface AudioControlsProps {
   onToggleMute: () => void;
   onToggleAudioShare: () => void;
-  // Stream a local file: opens the file picker when idle, stops the stream when
-  // one is active (the floating player also offers play/pause + stop).
+  // Stream audio: opens the source chooser when idle, stops the stream when one
+  // is active (the floating player also offers play/pause + stop).
   onToggleFileStream: () => void;
   // Flip the room-wide auto-ducking toggle (music dips under voice, or not).
   onToggleDucking: () => void;

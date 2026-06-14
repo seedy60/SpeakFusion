@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createWorker } from "mediasoup";
@@ -11,6 +12,14 @@ import { createSignalingServer } from "./signaling.js";
 import { RecordingManager } from "./recording.js";
 import { StreamManager } from "./streaming.js";
 import { createZipStream } from "./zip-stream.js";
+import {
+  assertPublicAudioUrl,
+  fetchPublicAudio,
+  isAudioContentType,
+  isAudioFileName,
+  looksLikeStreamContentType,
+  streamFallbackAudio,
+} from "./audio-sources.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -26,6 +35,7 @@ try {
 }
 
 const PORT = parseInt(process.env.PORT || "3100", 10);
+const AUDIO_LIBRARY_DIR = process.env.AUDIO_LIBRARY_DIR || "/var/lib/sonicroom/media";
 
 async function main() {
   // Create mediasoup workers
@@ -48,7 +58,6 @@ async function main() {
   const recordingManager = new RecordingManager();
   const streamManager = new StreamManager();
   const { postChatMessage } = createSignalingServer(httpServer, recordingManager, streamManager);
-
   // Health check
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", workers: workers.length });
@@ -77,6 +86,114 @@ async function main() {
   // (the visitor isn't connected to a socket yet), so it's a plain GET.
   app.get("/api/public-rooms", (_req, res) => {
     res.json({ rooms: getPublicRooms() });
+  });
+
+  // Audio sources for the in-call music/file streamer. The managed library is
+  // flat and audio-only; URL playback goes through this same-origin proxy so
+  // Web Audio can consume sources whose origin does not provide CORS headers.
+  app.get("/api/audio-library", async (_req, res) => {
+    try {
+      const entries = await readdir(AUDIO_LIBRARY_DIR, { withFileTypes: true });
+      const files = entries
+        .filter((entry) => entry.isFile() && isAudioFileName(entry.name))
+        .map((entry) => entry.name)
+        .sort((a, b) => a.localeCompare(b));
+      res.json({ files });
+    } catch (err) {
+      console.error(`[audio-library] list failed: ${String(err)}`);
+      res.status(500).json({ error: "Could not list server audio files" });
+    }
+  });
+
+  app.get("/api/audio-library/:name", (req, res) => {
+    if (!isAudioFileName(req.params.name)) {
+      res.status(404).json({ error: "Audio file not found" });
+      return;
+    }
+    res.sendFile(req.params.name, { root: AUDIO_LIBRARY_DIR, dotfiles: "deny" }, (err) => {
+      if (err && !res.headersSent) res.status(404).json({ error: "Audio file not found" });
+    });
+  });
+
+  app.get("/api/audio-proxy", async (req, res) => {
+    const raw = typeof req.query.url === "string" ? req.query.url : "";
+    if (!raw) {
+      res.status(400).json({ error: "Missing audio URL" });
+      return;
+    }
+
+    // Validate up front: blocks private/SSRF targets for both the direct proxy
+    // and the yt-dlp fallback, and gives a clean 400 for an unusable URL.
+    try {
+      await assertPublicAudioUrl(raw);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : "Audio URL failed" });
+      return;
+    }
+
+    // Whether the failed direct fetch looked like a media stream (IPTV/HLS/DASH/
+    // octet-stream) rather than a web page — routes the fallback to ffmpeg first.
+    let preferFfmpeg = false;
+
+    // 1) Direct path: a plain audio file or Icecast/HTTP radio stream. Kept for
+    //    these because it preserves Range requests (seeking) with no transcode.
+    try {
+      const upstream = await fetchPublicAudio(raw, req.headers.range);
+      const status = upstream.statusCode ?? 502;
+      const contentType = upstream.headers["content-type"] || "";
+      if (status >= 200 && status < 300 && isAudioContentType(contentType)) {
+        res.status(status);
+        res.setHeader("Content-Type", contentType);
+        for (const header of [
+          "accept-ranges",
+          "content-length",
+          "content-range",
+          "icy-br",
+          "icy-name",
+        ]) {
+          const value = upstream.headers[header];
+          if (value) res.setHeader(header, value);
+        }
+        res.on("close", () => upstream.destroy());
+        upstream.on("error", (err) => {
+          console.error(`[audio-proxy] stream failed: ${String(err)}`);
+          res.destroy(err);
+        });
+        upstream.pipe(res);
+        return;
+      }
+      // Not directly playable (an HTML page, a player redirect, a hotlink block,
+      // an IPTV `.ts`/octet-stream, …) — fall through to the transcoder. Note
+      // whether it smelled like a media stream so the fallback prefers ffmpeg.
+      preferFfmpeg = looksLikeStreamContentType(contentType);
+      upstream.destroy();
+    } catch (err) {
+      console.error(`[audio-proxy] direct fetch failed, trying transcode fallback: ${String(err)}`);
+    }
+
+    // 2) Fallback: transcode to a progressive Opus/WebM stream the <audio>
+    //    element can play. Direct media streams (IPTV `.ts`, HLS, DASH) go
+    //    through ffmpeg; sites (YouTube, SoundCloud, …) through yt-dlp. No Range
+    //    support here — it's a live transcode.
+    try {
+      const extracted = await streamFallbackAudio(raw, { preferFfmpeg });
+      res.status(200);
+      res.setHeader("Content-Type", extracted.contentType);
+      res.setHeader("Cache-Control", "no-store");
+      res.on("close", () => extracted.destroy());
+      extracted.stream.on("error", (err) => {
+        console.error(`[audio-proxy] transcode stream failed: ${String(err)}`);
+        res.destroy(err instanceof Error ? err : new Error(String(err)));
+      });
+      extracted.stream.pipe(res);
+    } catch (err) {
+      console.error(`[audio-proxy] transcode fallback failed: ${String(err)}`);
+      if (!res.headersSent) {
+        res.status(502).json({ error: "Could not get audio from that URL" });
+      } else {
+        res.destroy();
+      }
+    }
   });
 
   // Recording download — mixes all participants' captured audio into a single
