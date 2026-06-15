@@ -10,12 +10,16 @@ export function canSelectSpeaker(): boolean {
   return typeof AudioContext !== "undefined" && "setSinkId" in AudioContext.prototype;
 }
 
-// Best-effort: a stale/unplugged device id rejects — fall back to the default
-// output ("" per spec) instead of surfacing an error mid-call.
+// Route playback to a chosen output device. Only ever called with a REAL device
+// id: selecting the default output must NOT go through setSinkId("") — the
+// context already plays to the default (which is exactly why Firefox, with no
+// setSinkId at all, works), and Edge mishandles the empty-string "default" sink,
+// routing a setSinkId("")'d context to no output at all and silencing every
+// incoming stream. So an empty id is a no-op here (stay on the natural default);
+// a non-default id that's stale/unplugged just rejects and is left as-is rather
+// than reverting via the harmful setSinkId("").
 export function applySpeakerToContext(ctx: AudioContext, deviceId: string): void {
   const sinkable = ctx as SinkableContext;
-  if (!sinkable.setSinkId) return;
-  sinkable.setSinkId(deviceId).catch(() => {
-    if (deviceId) sinkable.setSinkId!("").catch(() => {});
-  });
+  if (!sinkable.setSinkId || !deviceId) return;
+  sinkable.setSinkId(deviceId).catch(() => {});
 }

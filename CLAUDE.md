@@ -91,7 +91,12 @@ The in-call "Stream audio" chooser (`AudioSourceDialog.tsx`) plays into the **sa
 
 ### Screen-reader announcements (rule: announcements go to chat)
 
-Every room-**event** announcement (recording start/stop, audio-share start/stop, music caster start/stop, mute/unmute, …) must go through the store's `announceEvent()`, which speaks it on the ARIA live region in `Room.tsx` **and** appends it to the chat history as a `kind: "system"` entry — chat is the single timeline of everything announced, readable later via the panel or the Alt+1..0 readback. Peer join/leave keeps its dedicated `kind: "join"/"leave"` entries (localized at render time; `system` entries snapshot the locale active at event time). Bare `announce()` is reserved for re-reading chat content that is already in history: the incoming `chat-message` announcement (which appends a one-time Alt+number hint on the session's first message) and the Alt+number readback itself.
+**One persisted preference — `announceMode` (`AnnounceMode`: `polite` / `assertive` / `tts` / `off`, set in the Chat panel header, "Announce messages and events") governs how EVERYTHING is surfaced: chat messages AND room events alike.** The pure `routeAnnounce()` in `stores/room.ts` is the single dispatcher — it fills exactly one of two always-mounted live regions (`politeMsg` → polite, `assertiveMsg` → assertive), speaks via `lib/tts` in `tts` mode, or does nothing in `off`; every call bumps `announceSeq` so a repeated identical line re-announces. All four store entry points route through it:
+
+- `announceEvent()` — a room **event** (recording start/stop, audio-share start/stop, music caster start/stop, mute/unmute, …): announces it **and** appends it to chat history as a `kind: "system"` entry. Chat is the single timeline of everything announced, readable later via the panel or the Alt+1..0 readback. (Don't lower it to bare `announce()` — that wouldn't log it.)
+- `announce()` — a transient room event that should NOT be logged (per-vote, the coalesced mute/unmute, file-player replace/pause/resume). Peer join/leave use `announce()` **plus** their own dedicated `kind: "join"/"leave"` chat entries (localized at render time; `system` entries snapshot the locale active at event time).
+- `announceChat()` — an incoming `chat-message` (which appends a one-time Alt+number hint on the session's first message).
+- `readback()` — on-demand re-reading (the Alt+number readback, the "copied" confirmation). The only path that ignores `off` (degrades to polite), since an explicit "read this" request must never be silent.
 
 ### Public rooms & moderation (knock-to-join, vote-to-kick)
 

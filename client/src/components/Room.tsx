@@ -90,6 +90,7 @@ export function Room() {
     sendChatMessage,
     decideJoinRequest,
     voteKick,
+    readAudioDiagnostics,
   } = useMediasoup();
 
   const [joinState, setJoinState] = useState<JoinState>("idle");
@@ -158,14 +159,12 @@ export function Room() {
   const fileStreamName = useRoomStore((s) => s.fileStreamName);
   const fileStreamPlaying = useRoomStore((s) => s.fileStreamPlaying);
   const messages = useRoomStore((s) => s.messages);
-  const announcement = useRoomStore((s) => s.announcement);
+  // All announcements (chat messages AND room events) ride the polite/assertive
+  // regions below, driven by the user's announceMode (the TTS mode speaks via the
+  // browser and leaves both strings empty; "off" fills neither).
   const announceSeq = useRoomStore((s) => s.announceSeq);
-  // Chat-message announcements ride their own polite/assertive regions, driven
-  // by the user's chatAnnounceMode (the other mode, TTS, speaks via the browser
-  // and leaves both strings empty).
-  const chatPoliteMsg = useRoomStore((s) => s.chatPoliteMsg);
-  const chatAssertiveMsg = useRoomStore((s) => s.chatAssertiveMsg);
-  const chatAnnounceSeq = useRoomStore((s) => s.chatAnnounceSeq);
+  const politeMsg = useRoomStore((s) => s.politeMsg);
+  const assertiveMsg = useRoomStore((s) => s.assertiveMsg);
   // True while we're knocking on a public room and waiting to be let in.
   const awaitingApproval = useRoomStore((s) => s.awaitingApproval);
   // Whether the room is public (shows the vote-to-kick controls) and whether we
@@ -273,7 +272,7 @@ export function Room() {
         if (digit != null) {
           e.preventDefault();
           const n = digit === "0" ? 10 : Number(digit);
-          const { messages: msgs, announce } = useRoomStore.getState();
+          const { messages: msgs, readback } = useRoomStore.getState();
           const msg = msgs[msgs.length - n];
           const now = Date.now();
           const prev = lastAltNumRef.current;
@@ -282,11 +281,11 @@ export function Room() {
             lastAltNumRef.current = null;
             void navigator.clipboard
               ?.writeText(messageContent(msg))
-              .then(() => announce(m.chat_copied()));
+              .then(() => readback(m.chat_copied()));
             return;
           }
           lastAltNumRef.current = { digit, at: now };
-          announce(msg ? formatMessage(msg, now) : m.room_no_message({ n }));
+          readback(msg ? formatMessage(msg, now) : m.room_no_message({ n }));
           return;
         }
       }
@@ -310,6 +309,12 @@ export function Room() {
       } else if (e.key === "r" || e.key === "R") {
         e.preventDefault();
         toggleRecording();
+      } else if (e.key === "i" || e.key === "I") {
+        // Accessible audio diagnostic — speaks the shared context state + incoming
+        // track summary (and tries to resume a suspended context). For debugging
+        // "I can't hear anything" reports without the browser console.
+        e.preventDefault();
+        readAudioDiagnostics();
       }
     };
 
@@ -317,7 +322,14 @@ export function Room() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [joinState, toggleMute, toggleAudioShare, toggleDucking, toggleRecording]);
+  }, [
+    joinState,
+    toggleMute,
+    toggleAudioShare,
+    toggleDucking,
+    toggleRecording,
+    readAudioDiagnostics,
+  ]);
 
   const handleLeave = useCallback(() => {
     postToHost("readyToClose");
@@ -544,22 +556,17 @@ export function Room() {
         <PoweredBy />
       </footer>
 
-      {/* Screen reader announcements (peer join/leave, recording, etc.).
-          key changes per announcement so identical messages re-announce. */}
-      <div aria-live="polite" role="status" className="sr-only" id="sr-announcements">
-        <span key={announceSeq}>{announcement}</span>
+      {/* Screen-reader announcements — chat messages AND room events (peer
+          join/leave, recording, mute, …) alike, following the user's preference
+          (Chat panel → "Announce messages and events"). Both regions are always
+          mounted; each announce fills only the one for the active mode (polite or
+          assertive), or neither in spoken-TTS / off modes. The key re-mounts the
+          span so a repeated identical line re-announces. */}
+      <div aria-live="polite" role="status" className="sr-only" id="sr-announce-polite">
+        <span key={`p-${announceSeq}`}>{politeMsg}</span>
       </div>
-
-      {/* Chat-message announcements on their OWN regions so they can follow the
-          user's preference (Chat panel → "Announce new messages"). Both are
-          always mounted; announceChat fills only the one for the active mode
-          (polite or assertive), or neither in spoken-TTS / off modes. The key
-          re-mounts the span so a repeated identical message re-announces. */}
-      <div aria-live="polite" role="status" className="sr-only" id="sr-chat-polite">
-        <span key={`cp-${chatAnnounceSeq}`}>{chatPoliteMsg}</span>
-      </div>
-      <div aria-live="assertive" role="alert" className="sr-only" id="sr-chat-assertive">
-        <span key={`ca-${chatAnnounceSeq}`}>{chatAssertiveMsg}</span>
+      <div aria-live="assertive" role="alert" className="sr-only" id="sr-announce-assertive">
+        <span key={`a-${announceSeq}`}>{assertiveMsg}</span>
       </div>
 
       {/* Knock-to-join: allow/deny people asking to enter this public room.

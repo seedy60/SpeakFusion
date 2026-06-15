@@ -100,7 +100,7 @@
   "chat_left": "{name} salió",
   "chat_just_now": "ahora mismo",
   "chat_announcement": "{sender}: {text} — enviado {time}",
-  "chat_announce_label": "Anunciar mensajes nuevos",
+  "chat_announce_label": "Anunciar mensajes y eventos",
   "chat_announce_polite": "Cortés",
   "chat_announce_assertive": "Asertivo",
   "chat_announce_tts": "En voz alta",

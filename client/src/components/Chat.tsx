@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Send, X } from "lucide-react";
-import { useRoomStore, type ChatAnnounceMode } from "../stores/room";
+import { useRoomStore, type AnnounceMode } from "../stores/room";
 import { relativeTime, messageContent, META_SEP } from "../lib/chat";
 import { warmUpTts } from "../lib/tts";
 import { m } from "../paraglide/messages.js";
@@ -21,9 +21,9 @@ interface ChatProps {
 // this panel is just the visible list + editor.
 export function Chat({ onSend, onClose, focusSignal }: ChatProps) {
   const messages = useRoomStore((s) => s.messages);
-  const announce = useRoomStore((s) => s.announce);
-  const chatAnnounceMode = useRoomStore((s) => s.chatAnnounceMode);
-  const setChatAnnounceMode = useRoomStore((s) => s.setChatAnnounceMode);
+  const readback = useRoomStore((s) => s.readback);
+  const announceMode = useRoomStore((s) => s.announceMode);
+  const setAnnounceMode = useRoomStore((s) => s.setAnnounceMode);
   const [text, setText] = useState("");
   // Active listbox option (roving via aria-activedescendant). -1 = none yet.
   const [activeIdx, setActiveIdx] = useState(-1);
@@ -76,7 +76,7 @@ export function Chat({ onSend, onClose, focusSignal }: ChatProps) {
       e.preventDefault();
       void navigator.clipboard
         ?.writeText(messageContent(msg))
-        .then(() => announce(m.chat_copied()));
+        .then(() => readback(m.chat_copied()));
       return;
     }
 
@@ -129,8 +129,9 @@ export function Chat({ onSend, onClose, focusSignal }: ChatProps) {
       <header className="flex items-center justify-between gap-2 border-b border-sonic-700 px-4 py-2.5">
         <h2 className="text-sm font-semibold text-sonic-100">{m.chat_heading()}</h2>
         <div className="flex items-center gap-1.5">
-          {/* How new messages are announced: a polite or assertive ARIA live
-              region, the browser's spoken voice (for users without a screen
+          {/* How everything is announced — chat messages AND room events
+              (join/leave, mute, recording, …) alike: a polite or assertive ARIA
+              live region, the browser's spoken voice (for users without a screen
               reader), or off. Persisted. Choosing "spoken" warms up speech
               synthesis from within this gesture so the first message isn't
               dropped. */}
@@ -139,11 +140,11 @@ export function Chat({ onSend, onClose, focusSignal }: ChatProps) {
           </label>
           <select
             id="chat-announce-mode"
-            value={chatAnnounceMode}
+            value={announceMode}
             onChange={(e) => {
-              const mode = e.target.value as ChatAnnounceMode;
+              const mode = e.target.value as AnnounceMode;
               if (mode === "tts") warmUpTts();
-              setChatAnnounceMode(mode);
+              setAnnounceMode(mode);
             }}
             title={m.chat_announce_label()}
             className="rounded-md border border-sonic-600 bg-sonic-900 px-1.5 py-1 text-xs text-sonic-200 focus:border-sonic-accent focus:outline-none"

@@ -153,10 +153,20 @@ function createAudioPipeline(track: MediaStreamTrack): Omit<PeerAudio, "consumer
   // iOS Safari requires webkit attributes
   (audioEl as unknown as Record<string, boolean>).playsInline = true;
   (audioEl as unknown as Record<string, string>).webkitPlaysinline = "true";
-  // Mute the HTML element — audio is routed through the shared AudioContext
-  audioEl.volume = 0;
+  // This element is only a keep-alive: it pulls the remote WebRTC track so it
+  // keeps flowing into the Web Audio graph (actual playback is sharedAudioContext's
+  // destination, below). Use the `muted` attribute, NOT volume = 0 — a volume-0
+  // but UNmuted element still counts as "audible" under autoplay policy, so a
+  // browser with stricter autoplay (notably Edge, whose Media autoplay defaults to
+  // "Limit") refuses to autoplay it; the track then never flows and ALL incoming
+  // audio (voice and music) goes silent. Muted media is always allowed to
+  // autoplay, and muting the element doesn't affect the Web Audio tap.
+  audioEl.muted = true;
 
   resumeSharedContext();
+  // Start it explicitly as well — autoplay alone can be flaky for a detached
+  // element, and a muted element is never autoplay-blocked, so this is safe.
+  void audioEl.play().catch(() => {});
 
   const sourceNode = sharedAudioContext.createMediaStreamSource(stream);
   const gainNode = sharedAudioContext.createGain();
@@ -1651,8 +1661,8 @@ export function useMediasoup() {
       // Incoming chat (including the echo of our own messages): render it, chime
       // a distinct cue, and announce it via the user's chosen channel — a polite
       // or assertive ARIA live region, or the browser's spoken TTS (announceChat
-      // reads chatAnnounceMode). Both sent and received messages flow through
-      // here (own messages come back as an echo), so both get announced.
+      // reads announceMode). Both sent and received messages flow through here
+      // (own messages come back as an echo), so both get announced.
       socket.on("chat-message", (msg: ChatMessage) => {
         store.getState().addMessage(msg);
         let announcement = formatMessage(msg, Date.now());
@@ -2231,6 +2241,44 @@ export function useMediasoup() {
     };
   }, [leave]);
 
+  // Accessible audio diagnostic (no console needed): reports the shared context's
+  // state + output sink and a summary of incoming tracks, spoken/region-read via
+  // readback (which goes through the live region or speechSynthesis, NOT the
+  // AudioContext — so it's audible even when the context itself is dead). Running
+  // it counts as a user gesture, so it also tries to resume a suspended context —
+  // if a recheck then reports "running" and audio returns, the bug was a stuck
+  // context. Wired to the "i" key in Room.
+  const readAudioDiagnostics = useCallback(() => {
+    const ctx = sharedAudioContext;
+    const sinkId = (ctx as unknown as { sinkId?: string }).sinkId;
+    const pipelines = [...peerAudiosRef.current.values()];
+    let live = 0;
+    let sourceMuted = 0;
+    let notPlaying = 0;
+    for (const pa of pipelines) {
+      const track = (pa.audioEl.srcObject as MediaStream | null)?.getAudioTracks()[0];
+      if (track?.readyState === "live") live += 1;
+      if (track?.muted) sourceMuted += 1;
+      if (pa.audioEl.paused) notPlaying += 1;
+    }
+    const wasSuspended = ctx.state !== "running";
+    if (wasSuspended) void ctx.resume().catch(() => {});
+    const n = pipelines.length;
+    const recvState = recvTransportRef.current?.connectionState ?? "none";
+    const sendState = sendTransportRef.current?.connectionState ?? "none";
+    store
+      .getState()
+      .readback(
+        `Audio status: context ${ctx.state}` +
+          `${wasSuspended ? " — tried to resume it, press i again to recheck" : ""}. ` +
+          `Receive transport ${recvState}, send transport ${sendState}. ` +
+          `Output ${sinkId ? "set to a specific device" : "default"}, ` +
+          `sample rate ${ctx.sampleRate}. ` +
+          `${n} incoming stream${n === 1 ? "" : "s"}: ` +
+          `${live} live, ${sourceMuted} silent at source, ${notPlaying} not playing.`,
+      );
+  }, [store]);
+
   return {
     join,
     leave,
@@ -2256,6 +2304,7 @@ export function useMediasoup() {
     setPeerVolume,
     setMicGain,
     sendChatMessage,
+    readAudioDiagnostics,
     peerAudiosRef,
   };
 }
