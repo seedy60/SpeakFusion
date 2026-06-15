@@ -61,9 +61,10 @@ interface ConsumeResult {
 }
 
 interface PeerAudio {
+  // The remote track plays DIRECTLY through this element (not Web Audio) — see
+  // createAudioPipeline. Per-peer volume/deafen/ducking are applied as its
+  // `.volume` via setElementVolume.
   audioEl: HTMLAudioElement;
-  gainNode: GainNode;
-  sourceNode: MediaStreamAudioSourceNode;
   // SFU-only
   consumer?: Consumer;
 }
@@ -138,6 +139,33 @@ const DUCK_ATTACK = 0.05;
 const DUCK_RELEASE = 0.09;
 const GAIN_RAMP = 0.03;
 
+// Per-peer playback gain is now an <audio> element's `.volume` (output goes
+// through elements, not Web Audio — Edge renders no Web Audio output). volume is
+// [0,1], so the per-listener boost above unity that the Web Audio gain allowed is
+// clamped away; everything else (attenuate, deafen, duck) is unchanged. A short
+// rAF ramp replaces setTargetAtTime so duck/volume changes don't click. One ramp
+// per element; a new ramp cancels the previous.
+const volumeRamps = new WeakMap<HTMLMediaElement, number>();
+function setElementVolume(el: HTMLMediaElement, target: number, seconds = GAIN_RAMP): void {
+  const to = Math.max(0, Math.min(1, target));
+  const prev = volumeRamps.get(el);
+  if (prev != null) cancelAnimationFrame(prev);
+  const ms = seconds * 1000;
+  if (ms <= 0) {
+    el.volume = to;
+    return;
+  }
+  const from = el.volume;
+  const t0 = performance.now();
+  const step = (now: number) => {
+    const p = Math.min(1, (now - t0) / ms);
+    el.volume = from + (to - from) * p;
+    if (p < 1) volumeRamps.set(el, requestAnimationFrame(step));
+    else volumeRamps.delete(el);
+  };
+  volumeRamps.set(el, requestAnimationFrame(step));
+}
+
 // Rapid mute/duck toggling would otherwise announce + chime on every single
 // flip — mute 10× and everyone hears/reads it 10×. Coalesce a burst: surface the
 // FIRST change immediately (leading edge, so a deliberate single toggle still
@@ -186,31 +214,31 @@ function createAudioPipeline(track: MediaStreamTrack): Omit<PeerAudio, "consumer
   // iOS Safari requires webkit attributes
   (audioEl as unknown as Record<string, boolean>).playsInline = true;
   (audioEl as unknown as Record<string, string>).webkitPlaysinline = "true";
-  // This element is only a keep-alive: it pulls the remote WebRTC track so it keeps
-  // flowing into the Web Audio graph (actual playback is the master element). Use
-  // the `muted` attribute — muted media is always allowed to autoplay, and muting
-  // doesn't affect the Web Audio tap.
-  audioEl.muted = true;
+  audioEl.setAttribute("aria-hidden", "true");
+  // Play the remote track DIRECTLY through this element — the universal WebRTC
+  // playback path that works in every browser. Incoming audio is deliberately NOT
+  // routed through Web Audio for output: on Edge both AudioContext.destination AND
+  // a MediaStreamAudioDestinationNode-through-an-element render silence (confirmed
+  // via the in-app diagnostic — real signal in the graph, nothing from the
+  // speakers), while a raw track on an <audio> element plays fine. Per-peer
+  // volume/deafen/ducking are this element's `.volume` (see effectiveGain +
+  // setElementVolume). The caller sets the correct starting volume right after.
+  audioEl.volume = 1;
+  applySpeakerToElement(audioEl, useRoomStore.getState().speakerDeviceId);
+  // Must be in the DOM and unmuted: Edge stays silent on a detached element.
+  if (typeof document !== "undefined" && document.body) document.body.appendChild(audioEl);
 
   resumeSharedContext();
   void audioEl.play().catch(() => {});
 
-  const sourceNode = sharedAudioContext.createMediaStreamSource(stream);
-  const gainNode = sharedAudioContext.createGain();
-  gainNode.gain.value = 1;
-  sourceNode.connect(gainNode);
-  // Out to the master element, NOT sharedAudioContext.destination (silent on Edge).
-  gainNode.connect(masterOutput);
-
-  return { audioEl, gainNode, sourceNode };
+  return { audioEl };
 }
 
 function destroyAudioPipeline(pa: PeerAudio) {
   pa.consumer?.close();
   pa.audioEl.srcObject = null;
   pa.audioEl.pause();
-  pa.sourceNode.disconnect();
-  pa.gainNode.disconnect();
+  pa.audioEl.remove();
 }
 
 export function useMediasoup() {
@@ -358,10 +386,9 @@ export function useMediasoup() {
   // deafen, per-peer volume, the live duck state, and the room ducking toggle).
   const rampMusicGains = useCallback(
     (ramp: number = GAIN_RAMP) => {
-      const now = sharedAudioContext.currentTime;
       for (const [peerId, pa] of peerAudiosRef.current) {
         if (!store.getState().peers.get(peerId)?.isMusic) continue;
-        pa.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, ramp);
+        setElementVolume(pa.audioEl, effectiveGain(peerId), ramp);
       }
     },
     [store, effectiveGain],
@@ -487,10 +514,13 @@ export function useMediasoup() {
   const speakerDeviceId = useRoomStore((s) => s.speakerDeviceId);
   const voiceProcessingEnabled = useRoomStore((s) => s.voiceProcessingEnabled);
 
-  // All incoming audio plays through the one master element, so the speaker pick
-  // is one setSinkId on it — it covers every peer, cue and monitor at once.
+  // Apply the speaker pick to every output element: each peer plays through its
+  // own element now, plus the master element (cues + local file monitor).
   useEffect(() => {
     applySpeakerToElement(masterAudioEl, speakerDeviceId);
+    for (const pa of peerAudiosRef.current.values()) {
+      applySpeakerToElement(pa.audioEl, speakerDeviceId);
+    }
   }, [speakerDeviceId]);
 
   // Mid-call mic setting change: re-acquire the mic with the selected device
@@ -612,7 +642,7 @@ export function useMediasoup() {
         // Respect deafen / per-peer volume on a (re)built P2P pipeline too —
         // otherwise an SFU→P2P switch resets everyone to full volume and a
         // deafened listener starts hearing audio again.
-        pipeline.gainNode.gain.value = effectiveGain(peerId);
+        setElementVolume(pipeline.audioEl, effectiveGain(peerId), 0);
         peerAudiosRef.current.set(peerId, pipeline);
       };
 
@@ -726,7 +756,7 @@ export function useMediasoup() {
         store.getState().setPeerMusic(producerId, true);
         shareOwnersRef.current.set(producerId, peerId);
         peerAudiosRef.current.set(producerId, { ...pipeline, consumer });
-        pipeline.gainNode.gain.value = effectiveGain(producerId);
+        setElementVolume(pipeline.audioEl, effectiveGain(producerId), 0);
         return;
       }
 
@@ -741,7 +771,7 @@ export function useMediasoup() {
         store.getState().setPeerMusic(producerId, true);
         fileOwnersRef.current.set(producerId, peerId);
         peerAudiosRef.current.set(producerId, { ...pipeline, consumer });
-        pipeline.gainNode.gain.value = effectiveGain(producerId);
+        setElementVolume(pipeline.audioEl, effectiveGain(producerId), 0);
         return;
       }
 
@@ -762,7 +792,7 @@ export function useMediasoup() {
 
       // Start at the correct gain: respects deafen, and ducks immediately if a
       // voice is already active when this (music) producer joins.
-      pipeline.gainNode.gain.value = effectiveGain(peerId);
+      setElementVolume(pipeline.audioEl, effectiveGain(peerId), 0);
     },
     [emit, store, effectiveGain],
   );
@@ -1776,9 +1806,8 @@ export function useMediasoup() {
     store.getState().setDeafened(!store.getState().isDeafened);
     // Recompute every peer's gain so un-deafen restores per-peer volume (and
     // any active music duck) instead of resetting everyone to 1.
-    const now = sharedAudioContext.currentTime;
     for (const [peerId, peerAudio] of peerAudiosRef.current) {
-      peerAudio.gainNode.gain.setTargetAtTime(effectiveGain(peerId), now, GAIN_RAMP);
+      setElementVolume(peerAudio.audioEl, effectiveGain(peerId), GAIN_RAMP);
     }
   }, [store, effectiveGain]);
 
@@ -1792,13 +1821,7 @@ export function useMediasoup() {
     (peerId: string, volume: number) => {
       store.getState().setPeerVolume(peerId, volume);
       const peerAudio = peerAudiosRef.current.get(peerId);
-      if (peerAudio) {
-        peerAudio.gainNode.gain.setTargetAtTime(
-          effectiveGain(peerId),
-          sharedAudioContext.currentTime,
-          GAIN_RAMP,
-        );
-      }
+      if (peerAudio) setElementVolume(peerAudio.audioEl, effectiveGain(peerId), GAIN_RAMP);
     },
     [store, effectiveGain],
   );
@@ -2277,49 +2300,27 @@ export function useMediasoup() {
   // it counts as a user gesture, so it also tries to resume a suspended context —
   // if a recheck then reports "running" and audio returns, the bug was a stuck
   // context. Wired to the "i" key in Room.
-  const readAudioDiagnostics = useCallback(async () => {
+  const readAudioDiagnostics = useCallback(() => {
     const ctx = sharedAudioContext;
-    const sinkId = (ctx as unknown as { sinkId?: string }).sinkId;
     const pipelines = [...peerAudiosRef.current.values()];
     let live = 0;
     let sourceMuted = 0;
     let notPlaying = 0;
+    let detached = 0;
+    let minVol = pipelines.length ? Infinity : 0;
     for (const pa of pipelines) {
       const track = (pa.audioEl.srcObject as MediaStream | null)?.getAudioTracks()[0];
       if (track?.readyState === "live") live += 1;
       if (track?.muted) sourceMuted += 1;
-      if (pa.audioEl.paused) notPlaying += 1;
+      if (pa.audioEl.paused) {
+        notPlaying += 1;
+        void pa.audioEl.play().catch(() => {}); // keypress is a gesture — retry
+      }
+      if (!pa.audioEl.isConnected) detached += 1;
+      minVol = Math.min(minVol, pa.audioEl.volume);
     }
     const wasSuspended = ctx.state !== "running";
     if (wasSuspended) void ctx.resume().catch(() => {});
-
-    // Measure the ACTUAL audible signal: tap each pipeline post-gain (the same
-    // node that feeds the speakers) with a temporary analyser and sample briefly.
-    // This separates "audio flows through Web Audio fine but the OS output stays
-    // silent" (signal > 0) from "the graph passes no samples here" (signal 0) —
-    // the last unknown now that everything else reads identical to Firefox.
-    const taps = pipelines.map((pa) => {
-      const an = ctx.createAnalyser();
-      an.fftSize = 2048;
-      pa.gainNode.connect(an);
-      return { pa, an };
-    });
-    await new Promise<void>((resolve) => setTimeout(() => resolve(), 250));
-    const buf = new Uint8Array(2048);
-    let peak = 0;
-    let minGain = taps.length ? Infinity : 0;
-    for (const { pa, an } of taps) {
-      an.getByteTimeDomainData(buf);
-      for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
-      minGain = Math.min(minGain, pa.gainNode.gain.value);
-      pa.gainNode.disconnect(an);
-    }
-
-    // The master <audio> element is the actual output now — report its state and
-    // (since this keypress is a gesture) try to start it if it's paused.
-    const me = masterAudioEl;
-    if (me.paused) void me.play().catch(() => {});
-    const meSink = (me as unknown as { sinkId?: string }).sinkId;
 
     const n = pipelines.length;
     const recvState = recvTransportRef.current?.connectionState ?? "none";
@@ -2327,19 +2328,12 @@ export function useMediasoup() {
     store
       .getState()
       .readback(
-        `Audio status: context ${ctx.state}` +
-          `${wasSuspended ? " — tried to resume it, press i again to recheck" : ""}. ` +
+        `Audio status: context ${ctx.state}. ` +
           `Receive transport ${recvState}, send transport ${sendState}. ` +
-          `Output ${sinkId ? "set to a specific device" : "default"}, ` +
-          `sample rate ${ctx.sampleRate}. ` +
-          `${n} incoming stream${n === 1 ? "" : "s"}: ` +
-          `${live} live, ${sourceMuted} silent at source, ${notPlaying} not playing. ` +
-          `Lowest gain ${minGain === Infinity ? "n/a" : minGain.toFixed(2)}, ` +
-          `signal level ${peak} of 128. ` +
-          `Master element ${me.paused ? "PAUSED" : "playing"}, ` +
-          `${me.isConnected ? "in DOM" : "DETACHED"}, muted ${me.muted}, ` +
-          `volume ${me.volume.toFixed(2)}, readyState ${me.readyState}, ` +
-          `sink ${meSink ? "specific" : "default"}.`,
+          `${n} incoming stream${n === 1 ? "" : "s"} (each plays through its own ` +
+          `audio element now): ${live} live, ${sourceMuted} silent at source, ` +
+          `${notPlaying} not playing, ${detached} detached. ` +
+          `Lowest element volume ${minVol === Infinity ? "n/a" : minVol.toFixed(2)}.`,
       );
   }, [store]);
 
