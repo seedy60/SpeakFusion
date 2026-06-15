@@ -118,6 +118,13 @@ masterAudioEl.srcObject = masterOutput.stream;
 masterAudioEl.autoplay = true;
 (masterAudioEl as unknown as Record<string, boolean>).playsInline = true;
 (masterAudioEl as unknown as Record<string, string>).webkitPlaysinline = "true";
+masterAudioEl.setAttribute("aria-hidden", "true");
+// Attach it to the document. A detached (never-appended) media element can report
+// `playing` with full readyState yet route NO audio to the OS output on Edge —
+// confirmed via the diagnostic (element playing, unmuted, volume 1, still silent).
+// Chrome/Firefox play detached elements fine, so this is harmless there. An <audio>
+// with no `controls` has no visual box, so appending is invisible.
+if (typeof document !== "undefined" && document.body) document.body.appendChild(masterAudioEl);
 // Route sound cues + the knock loop here too (they take the shared context, so the
 // node belongs to the same context — required for connect() not to throw).
 setCueDestination(masterOutput);
@@ -158,6 +165,10 @@ function resumeSharedContext() {
   }
   // The master element is NOT muted (it's the actual playback), so autoplay can be
   // blocked until a gesture — start it from these same gesture/statechange hooks.
+  // Also ensure it's attached (Edge stays silent on a detached element).
+  if (!masterAudioEl.isConnected && typeof document !== "undefined" && document.body) {
+    document.body.appendChild(masterAudioEl);
+  }
   if (masterAudioEl.paused) void masterAudioEl.play().catch(() => {});
 }
 document.addEventListener("touchstart", resumeSharedContext);
@@ -2325,7 +2336,8 @@ export function useMediasoup() {
           `${live} live, ${sourceMuted} silent at source, ${notPlaying} not playing. ` +
           `Lowest gain ${minGain === Infinity ? "n/a" : minGain.toFixed(2)}, ` +
           `signal level ${peak} of 128. ` +
-          `Master element ${me.paused ? "PAUSED" : "playing"}, muted ${me.muted}, ` +
+          `Master element ${me.paused ? "PAUSED" : "playing"}, ` +
+          `${me.isConnected ? "in DOM" : "DETACHED"}, muted ${me.muted}, ` +
           `volume ${me.volume.toFixed(2)}, readyState ${me.readyState}, ` +
           `sink ${meSink ? "specific" : "default"}.`,
       );
