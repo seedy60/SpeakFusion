@@ -471,12 +471,15 @@ export async function streamAudioWithFfmpeg(
 }
 
 // Each transcode spawns ffmpeg (and yt-dlp for site URLs), and /api/audio-proxy
-// is unauthenticated, so cap how many run at once — otherwise a burst of proxy
-// requests can exhaust the box's CPU / PIDs / sockets. Tunable via env; a busy
-// server rejects further transcodes with a 503 rather than thrashing.
+// is unauthenticated, so cap how many run at once — otherwise a flood of proxy
+// requests can exhaust the box's CPU / PIDs / sockets. A slot is held for the
+// whole playback, so this is "simultaneous live transcodes server-wide", not a
+// rate; only URLs that need transcoding count (plain audio / radio / library /
+// local files don't). Audio-only libopus is cheap, so the default is generous;
+// tune via env. A busy server rejects further transcodes with 503, not thrash.
 export const MAX_CONCURRENT_TRANSCODES = Math.max(
   1,
-  Number(process.env.AUDIO_TRANSCODE_LIMIT) || 4,
+  Number(process.env.AUDIO_TRANSCODE_LIMIT) || 32,
 );
 
 // Thrown by streamFallbackAudio when every transcode slot is taken; the route
