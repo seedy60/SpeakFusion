@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic, MicOff } from "lucide-react";
 import { useRoomStore, MAX_MIC_GAIN } from "../stores/room";
-import { applySpeakerToContext } from "../lib/audio-devices";
+import { applySpeakerToElement } from "../lib/audio-devices";
 import { microphoneConstraints } from "../lib/microphone";
 import { DeviceSettings } from "./DeviceSettings";
 import { m } from "../paraglide/messages.js";
@@ -64,6 +64,9 @@ export function MicPreview() {
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const gainRef = useRef<GainNode | null>(null);
+  // The <audio> element the monitor plays through (see start()). Output goes via
+  // an element, not ctx.destination, so it's audible on Edge too.
+  const monitorElRef = useRef<HTMLAudioElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const meterRef = useRef<HTMLDivElement | null>(null);
   // role="meter" element (precise value, read on demand) + the polite live
@@ -86,6 +89,11 @@ export function MicPreview() {
     ctxRef.current?.close().catch(() => {});
     ctxRef.current = null;
     gainRef.current = null;
+    if (monitorElRef.current) {
+      monitorElRef.current.pause();
+      monitorElRef.current.srcObject = null;
+      monitorElRef.current = null;
+    }
     const bar = meterRef.current;
     if (bar) {
       bar.style.transform = "scaleX(0)";
@@ -123,7 +131,6 @@ export function MicPreview() {
     streamRef.current = stream;
 
     const ctx = new AudioContext();
-    if (speakerId) applySpeakerToContext(ctx, speakerId);
     const source = ctx.createMediaStreamSource(stream);
     const gain = ctx.createGain();
     gain.gain.value = micGain;
@@ -144,10 +151,23 @@ export function MicPreview() {
     gain.connect(limiter);
     limiter.connect(analyser);
     analyser.connect(monitor);
-    monitor.connect(ctx.destination);
+    // Play the monitor through a real <audio> element, NOT ctx.destination — Edge
+    // can leave an AudioContext's destination silent even while the graph runs
+    // (same fix as the in-room master element). The Test-button click is the
+    // gesture that lets this unmuted element autoplay.
+    const monitorDest = ctx.createMediaStreamDestination();
+    monitor.connect(monitorDest);
+    const monitorEl = new Audio();
+    monitorEl.srcObject = monitorDest.stream;
+    monitorEl.autoplay = true;
+    (monitorEl as unknown as Record<string, boolean>).playsInline = true;
+    (monitorEl as unknown as Record<string, string>).webkitPlaysinline = "true";
+    applySpeakerToElement(monitorEl, speakerId);
+    void monitorEl.play().catch(() => {});
 
     ctxRef.current = ctx;
     gainRef.current = gain;
+    monitorElRef.current = monitorEl;
 
     const buf = new Float32Array(analyser.fftSize);
     // Closure state for the throttled, change-only screen-reader announcements.
@@ -210,10 +230,10 @@ export function MicPreview() {
     }
   }, [micDeviceId, voiceProcessingEnabled, stop, start]);
 
-  // Live-apply a speaker change to an active preview's context.
+  // Live-apply a speaker change to an active preview's monitor element.
   useEffect(() => {
-    const ctx = ctxRef.current;
-    if (ctx) applySpeakerToContext(ctx, speakerDeviceId);
+    const el = monitorElRef.current;
+    if (el) applySpeakerToElement(el, speakerDeviceId);
   }, [speakerDeviceId]);
 
   return (
