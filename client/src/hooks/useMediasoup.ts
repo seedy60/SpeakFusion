@@ -2304,6 +2304,12 @@ export function useMediasoup() {
       pa.gainNode.disconnect(an);
     }
 
+    // The master <audio> element is the actual output now — report its state and
+    // (since this keypress is a gesture) try to start it if it's paused.
+    const me = masterAudioEl;
+    if (me.paused) void me.play().catch(() => {});
+    const meSink = (me as unknown as { sinkId?: string }).sinkId;
+
     const n = pipelines.length;
     const recvState = recvTransportRef.current?.connectionState ?? "none";
     const sendState = sendTransportRef.current?.connectionState ?? "none";
@@ -2318,7 +2324,10 @@ export function useMediasoup() {
           `${n} incoming stream${n === 1 ? "" : "s"}: ` +
           `${live} live, ${sourceMuted} silent at source, ${notPlaying} not playing. ` +
           `Lowest gain ${minGain === Infinity ? "n/a" : minGain.toFixed(2)}, ` +
-          `signal level ${peak} of 128.`,
+          `signal level ${peak} of 128. ` +
+          `Master element ${me.paused ? "PAUSED" : "playing"}, muted ${me.muted}, ` +
+          `volume ${me.volume.toFixed(2)}, readyState ${me.readyState}, ` +
+          `sink ${meSink ? "specific" : "default"}.`,
       );
   }, [store]);
 
