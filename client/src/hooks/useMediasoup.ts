@@ -2248,7 +2248,7 @@ export function useMediasoup() {
   // it counts as a user gesture, so it also tries to resume a suspended context —
   // if a recheck then reports "running" and audio returns, the bug was a stuck
   // context. Wired to the "i" key in Room.
-  const readAudioDiagnostics = useCallback(() => {
+  const readAudioDiagnostics = useCallback(async () => {
     const ctx = sharedAudioContext;
     const sinkId = (ctx as unknown as { sinkId?: string }).sinkId;
     const pipelines = [...peerAudiosRef.current.values()];
@@ -2263,6 +2263,29 @@ export function useMediasoup() {
     }
     const wasSuspended = ctx.state !== "running";
     if (wasSuspended) void ctx.resume().catch(() => {});
+
+    // Measure the ACTUAL audible signal: tap each pipeline post-gain (the same
+    // node that feeds the speakers) with a temporary analyser and sample briefly.
+    // This separates "audio flows through Web Audio fine but the OS output stays
+    // silent" (signal > 0) from "the graph passes no samples here" (signal 0) —
+    // the last unknown now that everything else reads identical to Firefox.
+    const taps = pipelines.map((pa) => {
+      const an = ctx.createAnalyser();
+      an.fftSize = 2048;
+      pa.gainNode.connect(an);
+      return { pa, an };
+    });
+    await new Promise<void>((resolve) => setTimeout(() => resolve(), 250));
+    const buf = new Uint8Array(2048);
+    let peak = 0;
+    let minGain = taps.length ? Infinity : 0;
+    for (const { pa, an } of taps) {
+      an.getByteTimeDomainData(buf);
+      for (const v of buf) peak = Math.max(peak, Math.abs(v - 128));
+      minGain = Math.min(minGain, pa.gainNode.gain.value);
+      pa.gainNode.disconnect(an);
+    }
+
     const n = pipelines.length;
     const recvState = recvTransportRef.current?.connectionState ?? "none";
     const sendState = sendTransportRef.current?.connectionState ?? "none";
@@ -2275,7 +2298,9 @@ export function useMediasoup() {
           `Output ${sinkId ? "set to a specific device" : "default"}, ` +
           `sample rate ${ctx.sampleRate}. ` +
           `${n} incoming stream${n === 1 ? "" : "s"}: ` +
-          `${live} live, ${sourceMuted} silent at source, ${notPlaying} not playing.`,
+          `${live} live, ${sourceMuted} silent at source, ${notPlaying} not playing. ` +
+          `Lowest gain ${minGain === Infinity ? "n/a" : minGain.toFixed(2)}, ` +
+          `signal level ${peak} of 128.`,
       );
   }, [store]);
 

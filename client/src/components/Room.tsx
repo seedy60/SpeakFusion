@@ -314,7 +314,7 @@ export function Room() {
         // track summary (and tries to resume a suspended context). For debugging
         // "I can't hear anything" reports without the browser console.
         e.preventDefault();
-        readAudioDiagnostics();
+        void readAudioDiagnostics();
       }
     };
 
