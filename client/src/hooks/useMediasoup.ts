@@ -3,9 +3,9 @@ import { io, type Socket } from "socket.io-client";
 import { Device } from "mediasoup-client";
 import type { Transport, Producer, Consumer } from "mediasoup-client/types";
 import { forceOpusParams } from "../lib/sdp-munger";
-import { applySpeakerToContext } from "../lib/audio-devices";
+import { applySpeakerToElement } from "../lib/audio-devices";
 import { isIOS, microphoneConstraints } from "../lib/microphone";
-import { playCue, startKnockLoop } from "../lib/sounds";
+import { playCue, startKnockLoop, setCueDestination } from "../lib/sounds";
 import { formatMessage, RateLimiter, META_SEP, type ChatMessage } from "../lib/chat";
 import {
   announce_joined,
@@ -103,6 +103,25 @@ const sharedAudioContext = new AudioContext({
   latencyHint: "interactive",
 });
 
+// Master output. We deliberately do NOT play through `sharedAudioContext.destination`:
+// on some setups (confirmed on Microsoft Edge / Windows via the in-app audio
+// diagnostic) a running context with real signal flowing through the graph still
+// renders its `.destination` to NOTHING — every peer, cue and monitor goes silent
+// while Chrome/Firefox play the identical graph. HTMLAudioElement playback works
+// everywhere, so the whole mix is routed to a MediaStreamAudioDestinationNode and
+// played through one master <audio> element instead. Per-peer gain/ducking still
+// happen in Web Audio upstream of this node; speaker selection is setSinkId on
+// this element. Everything audible connects to `masterOutput`, never `.destination`.
+const masterOutput = sharedAudioContext.createMediaStreamDestination();
+const masterAudioEl = new Audio();
+masterAudioEl.srcObject = masterOutput.stream;
+masterAudioEl.autoplay = true;
+(masterAudioEl as unknown as Record<string, boolean>).playsInline = true;
+(masterAudioEl as unknown as Record<string, string>).webkitPlaysinline = "true";
+// Route sound cues + the knock loop here too (they take the shared context, so the
+// node belongs to the same context — required for connect() not to throw).
+setCueDestination(masterOutput);
+
 // Auto-ducking: how loud the music stays while someone is talking, and the
 // setTargetAtTime time-constants (seconds) for the gain ramps. Smaller = snappier.
 // Attack (duck down when a voice starts) is fast; release (bring the music back
@@ -137,6 +156,9 @@ function resumeSharedContext() {
     // statechange/visibility/gesture retries pick it up once it's allowed again.
     sharedAudioContext.resume().catch(() => {});
   }
+  // The master element is NOT muted (it's the actual playback), so autoplay can be
+  // blocked until a gesture — start it from these same gesture/statechange hooks.
+  if (masterAudioEl.paused) void masterAudioEl.play().catch(() => {});
 }
 document.addEventListener("touchstart", resumeSharedContext);
 document.addEventListener("click", resumeSharedContext);
@@ -153,26 +175,21 @@ function createAudioPipeline(track: MediaStreamTrack): Omit<PeerAudio, "consumer
   // iOS Safari requires webkit attributes
   (audioEl as unknown as Record<string, boolean>).playsInline = true;
   (audioEl as unknown as Record<string, string>).webkitPlaysinline = "true";
-  // This element is only a keep-alive: it pulls the remote WebRTC track so it
-  // keeps flowing into the Web Audio graph (actual playback is sharedAudioContext's
-  // destination, below). Use the `muted` attribute, NOT volume = 0 — a volume-0
-  // but UNmuted element still counts as "audible" under autoplay policy, so a
-  // browser with stricter autoplay (notably Edge, whose Media autoplay defaults to
-  // "Limit") refuses to autoplay it; the track then never flows and ALL incoming
-  // audio (voice and music) goes silent. Muted media is always allowed to
-  // autoplay, and muting the element doesn't affect the Web Audio tap.
+  // This element is only a keep-alive: it pulls the remote WebRTC track so it keeps
+  // flowing into the Web Audio graph (actual playback is the master element). Use
+  // the `muted` attribute — muted media is always allowed to autoplay, and muting
+  // doesn't affect the Web Audio tap.
   audioEl.muted = true;
 
   resumeSharedContext();
-  // Start it explicitly as well — autoplay alone can be flaky for a detached
-  // element, and a muted element is never autoplay-blocked, so this is safe.
   void audioEl.play().catch(() => {});
 
   const sourceNode = sharedAudioContext.createMediaStreamSource(stream);
   const gainNode = sharedAudioContext.createGain();
   gainNode.gain.value = 1;
   sourceNode.connect(gainNode);
-  gainNode.connect(sharedAudioContext.destination);
+  // Out to the master element, NOT sharedAudioContext.destination (silent on Edge).
+  gainNode.connect(masterOutput);
 
   return { audioEl, gainNode, sourceNode };
 }
@@ -459,10 +476,10 @@ export function useMediasoup() {
   const speakerDeviceId = useRoomStore((s) => s.speakerDeviceId);
   const voiceProcessingEnabled = useRoomStore((s) => s.voiceProcessingEnabled);
 
-  // All incoming audio plays through the shared context, so the speaker pick
-  // is one setSinkId there — it covers every peer, current and future.
+  // All incoming audio plays through the one master element, so the speaker pick
+  // is one setSinkId on it — it covers every peer, cue and monitor at once.
   useEffect(() => {
-    applySpeakerToContext(sharedAudioContext, speakerDeviceId);
+    applySpeakerToElement(masterAudioEl, speakerDeviceId);
   }, [speakerDeviceId]);
 
   // Mid-call mic setting change: re-acquire the mic with the selected device
@@ -1958,8 +1975,9 @@ export function useMediasoup() {
       // Its OWN destination → produced as a separate stereo "file" track.
       if (!g.fileDest) g.fileDest = sharedAudioContext.createMediaStreamDestination();
       source.connect(g.fileDest);
-      // Also monitor it locally, so the streamer hears what they're playing.
-      source.connect(sharedAudioContext.destination);
+      // Also monitor it locally, so the streamer hears what they're playing. Via
+      // the master element, not sharedAudioContext.destination (silent on Edge).
+      source.connect(masterOutput);
 
       // Stop the whole stream when the file ends or fails to decode.
       const ac = new AbortController();

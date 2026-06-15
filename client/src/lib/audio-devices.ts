@@ -23,3 +23,15 @@ export function applySpeakerToContext(ctx: AudioContext, deviceId: string): void
   if (!sinkable.setSinkId || !deviceId) return;
   sinkable.setSinkId(deviceId).catch(() => {});
 }
+
+// Route an <audio>/<video> element to a chosen output device. Unlike the
+// AudioContext form, HTMLMediaElement.setSinkId is mature and handles the empty
+// "default" id correctly, so "" (switch back to default) is safe here. Best-effort:
+// a stale/unplugged id rejects and is left as-is.
+type SinkableElement = HTMLMediaElement & { setSinkId?: (sinkId: string) => Promise<void> };
+
+export function applySpeakerToElement(el: HTMLMediaElement, deviceId: string): void {
+  const sinkable = el as SinkableElement;
+  if (!sinkable.setSinkId) return;
+  sinkable.setSinkId(deviceId).catch(() => {});
+}

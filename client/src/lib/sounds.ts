@@ -21,6 +21,21 @@ export type Cue =
   | "peer-mute"
   | "peer-unmute";
 
+// Where cues play out. Defaults to the context's own `.destination`, but the call
+// app can redirect them (via setCueDestination) to a shared output node — e.g. the
+// master-element MediaStreamAudioDestinationNode used to dodge Edge's silent
+// AudioContext.destination. Guarded by context identity so a stale node from a
+// different context can never be connected (which would throw).
+let cueDestination: AudioNode | null = null;
+
+export function setCueDestination(node: AudioNode | null): void {
+  cueDestination = node;
+}
+
+function cueOut(ctx: BaseAudioContext): AudioNode {
+  return cueDestination && cueDestination.context === ctx ? cueDestination : ctx.destination;
+}
+
 interface ToneSpec {
   freq: number;
   // Optional glide target — the pitch ramps from `freq` to `glideTo` over `dur`.
@@ -64,7 +79,7 @@ function tone(ctx: BaseAudioContext, spec: ToneSpec) {
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 
   osc.connect(g);
-  g.connect(ctx.destination);
+  g.connect(cueOut(ctx));
   osc.start(t0);
   osc.stop(t0 + dur + 0.02);
 }
@@ -109,7 +124,7 @@ function bell(ctx: BaseAudioContext, spec: BellSpec) {
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
 
   carrier.connect(g);
-  g.connect(ctx.destination);
+  g.connect(cueOut(ctx));
   carrier.start(t0);
   mod.start(t0);
   carrier.stop(t0 + dur + 0.02);
@@ -164,7 +179,7 @@ function noise(ctx: BaseAudioContext, spec: NoiseSpec) {
 
   src.connect(filter);
   filter.connect(g);
-  g.connect(ctx.destination);
+  g.connect(cueOut(ctx));
   src.start(t0);
   src.stop(t0 + dur + 0.02);
 }
@@ -232,7 +247,7 @@ function creak(ctx: BaseAudioContext, spec: CreakSpec) {
   osc.connect(filter);
   filter.connect(am);
   am.connect(env);
-  env.connect(ctx.destination);
+  env.connect(cueOut(ctx));
   osc.start(t0);
   lfo.start(t0);
   osc.stop(t0 + dur + 0.02);
@@ -418,7 +433,7 @@ export function startKnockLoop(ctx: AudioContext, periodSec = 2.6): () => void {
     src = ctx.createBufferSource();
     src.buffer = buffer;
     src.loop = true;
-    src.connect(ctx.destination);
+    src.connect(cueOut(ctx));
     src.start();
   });
 
