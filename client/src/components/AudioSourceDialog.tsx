@@ -21,22 +21,28 @@ export function AudioSourceDialog({
   onStartUrl,
   onStartServerFile,
 }: AudioSourceDialogProps) {
-  const browseButtonRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const optionRefs = useRef<Map<number, HTMLLIElement>>(new Map());
   const [url, setUrl] = useState("");
   // The server library is a browsable tree: `libPath` is the current folder
-  // ("" = root) and `entries` are its folders + audio files.
+  // ("" = root) and `entries` are its folders + audio files. `activeIdx` is the
+  // listbox's active option (roving via aria-activedescendant, like the lobby
+  // room list and the chat list — a single tab stop, arrow/Home/End to move).
   const [libPath, setLibPath] = useState("");
   const [entries, setEntries] = useState<LibraryEntry[]>([]);
+  const [activeIdx, setActiveIdx] = useState(-1);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
 
-  // Focus the "browse computer" button on open (runs once).
+  // Move focus into the dialog itself on open, so screen readers announce it as
+  // a dialog (focusing a child button doesn't reliably do that) and we don't
+  // drop the user into the URL text field.
   useEffect(() => {
-    browseButtonRef.current?.focus();
+    dialogRef.current?.focus();
   }, []);
 
-  // (Re)list whenever the folder changes.
+  // (Re)list whenever the folder changes; reset the active option to the top.
   useEffect(() => {
     let active = true;
     setLoading(true);
@@ -46,19 +52,28 @@ export function AudioSourceDialog({
         return (await res.json()) as { entries?: LibraryEntry[] };
       })
       .then(({ entries: next }) => {
-        if (active && Array.isArray(next)) setEntries(next);
+        if (!active || !Array.isArray(next)) return;
+        setEntries(next);
+        setActiveIdx(next.length ? 0 : -1);
       })
       .catch(() => {
         // The library is optional and a folder may be unreadable — fall through
         // to the empty state. The `error` banner is reserved for an actual
         // failure to *start* a source.
-        if (active) setEntries([]);
+        if (!active) return;
+        setEntries([]);
+        setActiveIdx(-1);
       })
       .finally(() => active && setLoading(false));
     return () => {
       active = false;
     };
   }, [libPath]);
+
+  // Keep the active option scrolled into view as it roves.
+  useEffect(() => {
+    if (activeIdx >= 0) optionRefs.current.get(activeIdx)?.scrollIntoView({ block: "nearest" });
+  }, [activeIdx]);
 
   const start = async (action: () => Promise<void>) => {
     setStarting(true);
@@ -75,13 +90,46 @@ export function AudioSourceDialog({
   const atRoot = libPath === "";
   const openFolder = (name: string) => setLibPath((p) => (p ? `${p}/${name}` : name));
   const goUp = () => setLibPath((p) => p.split("/").slice(0, -1).join("/"));
-  const streamFile = (name: string) =>
-    void start(() => onStartServerFile(libPath ? `${libPath}/${name}` : name));
+  const activateEntry = (entry: LibraryEntry) => {
+    if (entry.dir) openFolder(entry.name);
+    else if (!starting)
+      void start(() => onStartServerFile(libPath ? `${libPath}/${entry.name}` : entry.name));
+  };
 
   const submitUrl = (e: FormEvent) => {
     e.preventDefault();
     const value = url.trim();
     if (value) void start(() => onStartUrl(value));
+  };
+
+  // Listbox keyboard model, same as the lobby room list / chat list: arrow keys
+  // and Home/End move the active option; Enter or Space activates it.
+  const onListKeyDown = (e: KeyboardEvent<HTMLUListElement>) => {
+    if (entries.length === 0) return;
+    const last = entries.length - 1;
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setActiveIdx((i) => Math.min((i < 0 ? -1 : i) + 1, last));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setActiveIdx((i) => Math.max((i < 0 ? entries.length : i) - 1, 0));
+        break;
+      case "Home":
+        e.preventDefault();
+        setActiveIdx(0);
+        break;
+      case "End":
+        e.preventDefault();
+        setActiveIdx(last);
+        break;
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        if (activeIdx >= 0 && entries[activeIdx]) activateEntry(entries[activeIdx]);
+        break;
+    }
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -107,11 +155,13 @@ export function AudioSourceDialog({
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4">
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="audio-source-heading"
+        tabIndex={-1}
         onKeyDown={onKeyDown}
-        className="w-full max-w-md rounded-xl border border-sonic-600 bg-sonic-800 p-4 shadow-2xl"
+        className="w-full max-w-md rounded-xl border border-sonic-600 bg-sonic-800 p-4 shadow-2xl focus:outline-none"
       >
         <div className="mb-4 flex items-center gap-2">
           <FileMusic className="h-5 w-5 text-sonic-accent" aria-hidden="true" />
@@ -129,7 +179,6 @@ export function AudioSourceDialog({
         </div>
 
         <button
-          ref={browseButtonRef}
           type="button"
           disabled={starting}
           onClick={onChooseComputerFile}
@@ -167,10 +216,11 @@ export function AudioSourceDialog({
           </div>
         </form>
 
-        {/* Server library: a folder browser. Back button + Backspace go up a
-            level; names truncate visually (CSS) but the full name stays in each
-            button's accessible label. */}
-        <div role="group" aria-label={m.audio_source_library_label()}>
+        {/* Server library folder browser. The list is a single-tab-stop listbox
+            (arrow keys / Home / End move the active row, Enter/Space activates);
+            the back button or Backspace goes up a level. Names truncate via CSS
+            while the full name stays in each option's aria-label. */}
+        <div>
           <div className="mb-1 flex items-center gap-1.5">
             {!atRoot && (
               <button
@@ -183,6 +233,7 @@ export function AudioSourceDialog({
               </button>
             )}
             <span
+              id="audio-source-library-path"
               className="min-w-0 flex-1 truncate text-xs font-medium text-sonic-300"
               title={libPath || undefined}
             >
@@ -199,28 +250,42 @@ export function AudioSourceDialog({
               {atRoot ? m.audio_source_library_empty() : m.audio_source_folder_empty()}
             </p>
           ) : (
-            <ul className="max-h-48 space-y-0.5 overflow-y-auto rounded-lg border border-sonic-600 bg-sonic-900/40 p-1">
-              {entries.map((entry) => (
-                <li key={`${entry.dir ? "d" : "f"}:${entry.name}`}>
-                  <button
-                    type="button"
-                    disabled={starting}
-                    onClick={() => (entry.dir ? openFolder(entry.name) : streamFile(entry.name))}
-                    aria-label={
-                      entry.dir
-                        ? m.audio_source_open_folder({ name: entry.name })
-                        : m.audio_source_stream_named({ name: entry.name })
-                    }
-                    title={entry.name}
-                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm text-sonic-100 hover:bg-sonic-700 disabled:opacity-50"
-                  >
-                    {entry.dir ? (
-                      <Folder className="h-4 w-4 shrink-0 text-sonic-accent" aria-hidden="true" />
-                    ) : (
-                      <Music className="h-4 w-4 shrink-0 text-sonic-300" aria-hidden="true" />
-                    )}
-                    <span className="truncate">{entry.name}</span>
-                  </button>
+            <ul
+              role="listbox"
+              tabIndex={0}
+              aria-labelledby="audio-source-library-path"
+              aria-activedescendant={activeIdx >= 0 ? `audio-source-opt-${activeIdx}` : undefined}
+              onKeyDown={onListKeyDown}
+              onFocus={() => setActiveIdx((i) => (i < 0 && entries.length ? 0 : i))}
+              className="max-h-48 space-y-0.5 overflow-y-auto rounded-lg border border-sonic-600 bg-sonic-900/40 p-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-sonic-accent/60"
+            >
+              {entries.map((entry, i) => (
+                <li
+                  key={`${entry.dir ? "d" : "f"}:${entry.name}`}
+                  id={`audio-source-opt-${i}`}
+                  role="option"
+                  aria-selected={i === activeIdx}
+                  aria-label={
+                    entry.dir
+                      ? m.audio_source_open_folder({ name: entry.name })
+                      : m.audio_source_stream_named({ name: entry.name })
+                  }
+                  ref={(el) => {
+                    if (el) optionRefs.current.set(i, el);
+                    else optionRefs.current.delete(i);
+                  }}
+                  onClick={() => activateEntry(entry)}
+                  title={entry.name}
+                  className={`flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-sonic-100 ${
+                    i === activeIdx ? "bg-sonic-700" : "hover:bg-sonic-700/60"
+                  }`}
+                >
+                  {entry.dir ? (
+                    <Folder className="h-4 w-4 shrink-0 text-sonic-accent" aria-hidden="true" />
+                  ) : (
+                    <Music className="h-4 w-4 shrink-0 text-sonic-300" aria-hidden="true" />
+                  )}
+                  <span className="truncate">{entry.name}</span>
                 </li>
               ))}
             </ul>
